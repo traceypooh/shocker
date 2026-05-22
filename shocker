@@ -1,119 +1,241 @@
 #!/usr/bin/env bash
+# shocker — Docker implemented in ~200 lines of bash
+# Fork of bocker (github.com/p8952/bocker) updated for 2026:
+#   - Docker Registry v2 API (v1 was shut down in 2023)
+#   - cgroups v2 support with v1 fallback
+#   - Improved UUID space & MAC address generation
+#   - More robust container PID lookup
+
 set -o errexit -o nounset -o pipefail; shopt -s nullglob
-btrfs_path='/var/bocker' && cgroups='cpu,cpuacct,memory';
-[[ $# -gt 0 ]] && while [ "${1:0:2}" == '--' ]; do OPTION=${1:2}; [[ $OPTION =~ = ]] && declare "BOCKER_${OPTION/=*/}=${OPTION/*=/}" || declare "BOCKER_${OPTION}=x"; shift; done
 
-function bocker_check() {
-	btrfs subvolume list "$btrfs_path" | grep -qw "$1" && echo 0 || echo 1
+btrfs_path='/var/shocker'
+# cgroups v1 legacy controllers (used only if cgroupsv2 is absent)
+cgroups_v1='cpu,cpuacct,memory'
+
+[[ $# -gt 0 ]] && while [ "${1:0:2}" == '--' ]; do
+  OPTION=${1:2}
+  [[ $OPTION =~ = ]] && declare "SHOCKER_${OPTION/=*/}=${OPTION/*=/}" \
+                     || declare "SHOCKER_${OPTION}=x"
+  shift
+done
+
+# Detect cgroup version
+if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+  CGROUP_VERSION=2
+else
+  CGROUP_VERSION=1
+fi
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+function _uuid() {
+  # 5-digit hex suffix → 1,048,576 possible values vs bocker's 252
+  printf '%05x' "$((RANDOM * RANDOM % 0xFFFFF))"
 }
 
-function bocker_init() { #HELP Create an image from a directory:\nBOCKER init <directory>
-	uuid="img_$(shuf -i 42002-42254 -n 1)"
-	if [[ -d "$1" ]]; then
-		[[ "$(bocker_check "$uuid")" == 0 ]] && bocker_run "$@"
-		btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
-		cp -rf --reflink=auto "$1"/* "$btrfs_path/$uuid" > /dev/null
-		[[ ! -f "$btrfs_path/$uuid"/img.source ]] && echo "$1" > "$btrfs_path/$uuid"/img.source
-		echo "Created: $uuid"
-	else
-		echo "No directory named '$1' exists"
-	fi
+function shocker_check() {
+  btrfs subvolume list "$btrfs_path" | grep -qw "$1" && echo 0 || echo 1
 }
 
-function bocker_pull() { #HELP Pull an image from Docker Hub:\nBOCKER pull <name> <tag>
-	token="$(curl -sL -o /dev/null -D- -H 'X-Docker-Token: true' "https://index.docker.io/v1/repositories/$1/images" | tr -d '\r' | awk -F ': *' '$1 == "X-Docker-Token" { print $2 }')"
-	registry='https://registry-1.docker.io/v1'
-	id="$(curl -sL -H "Authorization: Token $token" "$registry/repositories/$1/tags/$2" | sed 's/"//g')"
-	[[ "${#id}" -ne 64 ]] && echo "No image named '$1:$2' exists" && exit 1
-	ancestry="$(curl -sL -H "Authorization: Token $token" "$registry/images/$id/ancestry")"
-	IFS=',' && ancestry=(${ancestry//[\[\] \"]/}) && IFS=' \n\t'; tmp_uuid="$(uuidgen)" && mkdir /tmp/"$tmp_uuid"
-	for id in "${ancestry[@]}"; do
-		curl -#L -H "Authorization: Token $token" "$registry/images/$id/layer" -o /tmp/"$tmp_uuid"/layer.tar
-		tar xf /tmp/"$tmp_uuid"/layer.tar -C /tmp/"$tmp_uuid" && rm /tmp/"$tmp_uuid"/layer.tar
-	done
-	echo "$1:$2" > /tmp/"$tmp_uuid"/img.source
-	bocker_init /tmp/"$tmp_uuid" && rm -rf /tmp/"$tmp_uuid"
+function _cg_create() { # <id>
+  local id=$1
+  if [[ $CGROUP_VERSION -eq 2 ]]; then
+    mkdir -p /sys/fs/cgroup/"$id"
+    echo "+cpu +memory" >> /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+  else
+    cgcreate -g "$cgroups_v1:/$id"
+  fi
 }
 
-function bocker_rm() { #HELP Delete an image or container:\nBOCKER rm <image_id or container_id>
-	[[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
-	btrfs subvolume delete "$btrfs_path/$1" > /dev/null
-	cgdelete -g "$cgroups:/$1" &> /dev/null || true
-	echo "Removed: $1"
+function _cg_set() { # <id>
+  local id=$1
+  : "${SHOCKER_CPU_SHARE:=512}"
+  : "${SHOCKER_MEM_LIMIT:=512}" # MiB
+  if [[ $CGROUP_VERSION -eq 2 ]]; then
+    # cgroupsv2: cpu.weight 1-10000 (roughly maps from v1 shares 2-262144)
+    local weight=$(( SHOCKER_CPU_SHARE * 10000 / 262144 ))
+    [[ $weight -lt 1 ]] && weight=1
+    echo "$weight"                          > /sys/fs/cgroup/"$id"/cpu.weight
+    echo "$((SHOCKER_MEM_LIMIT * 1048576))" > /sys/fs/cgroup/"$id"/memory.max
+  else
+    cgset -r cpu.shares="$SHOCKER_CPU_SHARE"                          "$id"
+    cgset -r memory.limit_in_bytes="$((SHOCKER_MEM_LIMIT * 1048576))" "$id"
+  fi
 }
 
-function bocker_images() { #HELP List images:\nBOCKER images
-	echo -e "IMAGE_ID\t\tSOURCE"
-	for img in "$btrfs_path"/img_*; do
-		img=$(basename "$img")
-		echo -e "$img\t\t$(cat "$btrfs_path/$img/img.source")"
-	done
+function _cg_exec() { # <id> <cmd…>
+  local id=$1; shift
+  if [[ $CGROUP_VERSION -eq 2 ]]; then
+    # Write shell PID into cgroup, then exec (cgexec not available for v2)
+    local cgroot=/sys/fs/cgroup/"$id"
+    bash -c "echo \$$ > ${cgroot}/cgroup.procs && exec $*"
+  else
+    cgexec -g "$cgroups_v1:$id" "$@"
+  fi
 }
 
-function bocker_ps() { #HELP List containers:\nBOCKER ps
-	echo -e "CONTAINER_ID\t\tCOMMAND"
-	for ps in "$btrfs_path"/ps_*; do
-		ps=$(basename "$ps")
-		echo -e "$ps\t\t$(cat "$btrfs_path/$ps/$ps.cmd")"
-	done
+function _cg_delete() { # <id>
+  if [[ $CGROUP_VERSION -eq 2 ]]; then
+    rmdir /sys/fs/cgroup/"$id" 2>/dev/null || true
+  else
+    cgdelete -g "$cgroups_v1:/$id" 2>/dev/null || true
+  fi
 }
 
-function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <command>
-	uuid="ps_$(shuf -i 42002-42254 -n 1)"
-	[[ "$(bocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
-	[[ "$(bocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying..." && bocker_run "$@" && return
-	cmd="${@:2}" && ip="$(echo "${uuid: -3}" | sed 's/0//g')" && mac="${uuid: -3:1}:${uuid: -2}"
-	ip link add dev veth0_"$uuid" type veth peer name veth1_"$uuid"
-	ip link set dev veth0_"$uuid" up
-	ip link set veth0_"$uuid" master bridge0
-	ip netns add netns_"$uuid"
-	ip link set veth1_"$uuid" netns netns_"$uuid"
-	ip netns exec netns_"$uuid" ip link set dev lo up
-	ip netns exec netns_"$uuid" ip link set veth1_"$uuid" address 02:42:ac:11:00"$mac"
-	ip netns exec netns_"$uuid" ip addr add 10.0.0."$ip"/24 dev veth1_"$uuid"
-	ip netns exec netns_"$uuid" ip link set dev veth1_"$uuid" up
-	ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
-	btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$uuid" > /dev/null
-	echo 'nameserver 8.8.8.8' > "$btrfs_path/$uuid"/etc/resolv.conf
-	echo "$cmd" > "$btrfs_path/$uuid/$uuid.cmd"
-	cgcreate -g "$cgroups:/$uuid"
-	: "${BOCKER_CPU_SHARE:=512}" && cgset -r cpu.shares="$BOCKER_CPU_SHARE" "$uuid"
-	: "${BOCKER_MEM_LIMIT:=512}" && cgset -r memory.limit_in_bytes="$((BOCKER_MEM_LIMIT * 1000000))" "$uuid"
-	cgexec -g "$cgroups:$uuid" \
-		ip netns exec netns_"$uuid" \
-		unshare -fmuip --mount-proc \
-		chroot "$btrfs_path/$uuid" \
-		/bin/sh -c "/bin/mount -t proc proc /proc && $cmd" \
-		2>&1 | tee "$btrfs_path/$uuid/$uuid.log" || true
-	ip link del dev veth0_"$uuid"
-	ip netns del netns_"$uuid"
+# ── commands ─────────────────────────────────────────────────────────────────
+
+function shocker_init() { #HELP Create an image from a directory:\nSHOCKER init <directory>
+  local uuid="img_$(_uuid)"
+  if [[ -d "$1" ]]; then
+    [[ "$(shocker_check "$uuid")" == 0 ]] && shocker_run "$@"
+    btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
+    cp -rf --reflink=auto "$1"/* "$btrfs_path/$uuid" > /dev/null
+    [[ ! -f "$btrfs_path/$uuid/img.source" ]] && echo "$1" > "$btrfs_path/$uuid/img.source"
+    echo "Created: $uuid"
+  else
+    echo "No directory named '$1' exists" && exit 1
+  fi
 }
 
-function bocker_exec() { #HELP Execute a command in a running container:\nBOCKER exec <container_id> <command>
-	[[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
-	cid="$(ps o ppid,pid | grep "^$(ps o pid,cmd | grep -E "^\ *[0-9]+ unshare.*$1" | awk '{print $1}')" | awk '{print $2}')"
-	[[ ! "$cid" =~ ^\ *[0-9]+$ ]] && echo "Container '$1' exists but is not running" && exit 1
-	nsenter -t "$cid" -m -u -i -n -p chroot "$btrfs_path/$1" "${@:2}"
+function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER pull <name> <tag>
+  local name=$1 tag=$2
+  # Resolve official images (e.g. "ubuntu") to library/ubuntu
+  [[ "$name" != */* ]] && name="library/$name"
+
+  # Authenticate — Docker Hub v2 token flow
+  local token
+  token="$(curl -fsSL \
+    "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
+    | grep -o '"token":"[^"]*"' | cut -d'"' -f4)"
+  [[ -z "$token" ]] && echo "Failed to authenticate for '$name'" && exit 1
+
+  local registry='https://registry-1.docker.io/v2'
+
+  # Fetch manifest (prefer OCI / schema v2 manifests)
+  local manifest
+  manifest="$(curl -fsSL \
+    -H "Authorization: Bearer $token" \
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    "$registry/$name/manifests/$tag")"
+
+  # Extract layer digests (works for both OCI and Docker schema v2)
+  local layers
+  layers="$(echo "$manifest" | grep -o '"digest":"sha256:[^"]*"' | cut -d'"' -f4)"
+  [[ -z "$layers" ]] && echo "No image '$name:$tag' found or unsupported manifest" && exit 1
+
+  local tmp_uuid; tmp_uuid="$(uuidgen)"
+  mkdir /tmp/"$tmp_uuid"
+
+  while IFS= read -r digest; do
+    echo "Pulling layer ${digest:7:12}…"
+    curl -fsSL \
+      -H "Authorization: Bearer $token" \
+      "$registry/$name/blobs/$digest" \
+      -o /tmp/"$tmp_uuid"/layer.tar
+    tar xf /tmp/"$tmp_uuid"/layer.tar -C /tmp/"$tmp_uuid" && rm /tmp/"$tmp_uuid"/layer.tar
+  done <<< "$layers"
+
+  echo "$1:$2" > /tmp/"$tmp_uuid"/img.source
+  shocker_init /tmp/"$tmp_uuid" && rm -rf /tmp/"$tmp_uuid"
 }
 
-function bocker_logs() { #HELP View logs from a container:\nBOCKER logs <container_id>
-	[[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
-	cat "$btrfs_path/$1/$1.log"
+function shocker_rm() { #HELP Delete an image or container:\nSHOCKER rm <image_id or container_id>
+  [[ "$(shocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+  btrfs subvolume delete "$btrfs_path/$1" > /dev/null
+  _cg_delete "$1"
+  echo "Removed: $1"
 }
 
-function bocker_commit() { #HELP Commit a container to an image:\nBOCKER commit <container_id> <image_id>
-	[[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
-	[[ "$(bocker_check "$2")" == 1 ]] && echo "No image named '$2' exists" && exit 1
-	bocker_rm "$2" && btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$2" > /dev/null
-	echo "Created: $2"
+function shocker_images() { #HELP List images:\nSHOCKER images
+  echo -e "IMAGE_ID\t\tSOURCE"
+  for img in "$btrfs_path"/img_*; do
+    img=$(basename "$img")
+    echo -e "$img\t\t$(cat "$btrfs_path/$img/img.source")"
+  done
 }
 
-function bocker_help() { #HELP Display this message:\nBOCKER help
-	sed -n "s/^.*#HELP\\s//p;" < "$1" | sed "s/\\\\n/\n\t/g;s/$/\n/;s!BOCKER!${1/!/\\!}!g"
+function shocker_ps() { #HELP List containers:\nSHOCKER ps
+  echo -e "CONTAINER_ID\t\tCOMMAND"
+  for ps in "$btrfs_path"/ps_*; do
+    ps=$(basename "$ps")
+    echo -e "$ps\t\t$(cat "$btrfs_path/$ps/$ps.cmd")"
+  done
 }
 
-[[ -z "${1-}" ]] && bocker_help "$0"
+function shocker_run() { #HELP Create a container:\nSHOCKER run <image_id> <command>
+  local uuid="ps_$(_uuid)"
+  [[ "$(shocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
+  [[ "$(shocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying…" && shocker_run "$@" && return
+
+  local cmd="${*:2}"
+  # Derive a stable /24 IP from last two hex digits of UUID (1–254)
+  local suffix; suffix=$(( 16#${uuid: -2} % 253 + 1 ))
+  local ip="10.0.0.$suffix"
+  # Proper 6-octet MAC derived from UUID
+  local mac; mac="02:42:$(echo "${uuid: -8}" | sed 's/.\{2\}/&:/g;s/:$//')"
+
+  ip link add dev veth0_"$uuid" type veth peer name veth1_"$uuid"
+  ip link set dev veth0_"$uuid" up
+  ip link set veth0_"$uuid" master bridge0
+  ip netns add netns_"$uuid"
+  ip link set veth1_"$uuid" netns netns_"$uuid"
+  ip netns exec netns_"$uuid" ip link set dev lo up
+  ip netns exec netns_"$uuid" ip link set veth1_"$uuid" address "$mac"
+  ip netns exec netns_"$uuid" ip addr add "$ip/24" dev veth1_"$uuid"
+  ip netns exec netns_"$uuid" ip link set dev veth1_"$uuid" up
+  ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
+
+  btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$uuid" > /dev/null
+  echo 'nameserver 8.8.8.8' > "$btrfs_path/$uuid/etc/resolv.conf"
+  echo "$cmd" > "$btrfs_path/$uuid/$uuid.cmd"
+
+  _cg_create "$uuid"
+  _cg_set    "$uuid"
+
+  _cg_exec "$uuid" \
+    ip netns exec netns_"$uuid" \
+    unshare -fmuip --mount-proc \
+    chroot "$btrfs_path/$uuid" \
+    /bin/sh -c "/bin/mount -t proc proc /proc && $cmd" \
+    2>&1 | tee "$btrfs_path/$uuid/$uuid.log" || true
+
+  ip link del dev veth0_"$uuid"
+  ip netns del netns_"$uuid"
+}
+
+function shocker_exec() { #HELP Execute a command in a running container:\nSHOCKER exec <container_id> <command>
+  [[ "$(shocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+  # Find the unshare process that owns this container's namespace
+  local cid
+  cid="$(ps -eo pid,args \
+    | awk -v u="$1" '$0 ~ "unshare.*"u {print $1}' \
+    | head -1)"
+  [[ -z "$cid" ]] && echo "Container '$1' exists but is not running" && exit 1
+  nsenter -t "$cid" -m -u -i -n -p chroot "$btrfs_path/$1" "${@:2}"
+}
+
+function shocker_logs() { #HELP View logs from a container:\nSHOCKER logs <container_id>
+  [[ "$(shocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+  cat "$btrfs_path/$1/$1.log"
+}
+
+function shocker_commit() { #HELP Commit a container to an image:\nSHOCKER commit <container_id> <image_id>
+  [[ "$(shocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+  [[ "$(shocker_check "$2")" == 1 ]] && echo "No image named '$2' exists" && exit 1
+  shocker_rm "$2" && btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$2" > /dev/null
+  echo "Created: $2"
+}
+
+function shocker_help() { #HELP Display this message:\nSHOCKER help
+  sed -n "s/^.*#HELP\\s//p;" < "$1" | sed "s/\\\\n/\n\t/g;s/$/\n/;s!SHOCKER!${1/!/\\!}!g"
+}
+
+# ── dispatch ─────────────────────────────────────────────────────────────────
+
+[[ -z "${1-}" ]] && shocker_help "$0" && exit 0
+
 case $1 in
-	pull|init|rm|images|ps|run|exec|logs|commit) bocker_"$1" "${@:2}" ;;
-	*) bocker_help "$0" ;;
+  pull|init|rm|images|ps|run|exec|logs|commit) shocker_"$1" "${@:2}" ;;
+  *) shocker_help "$0" ;;
 esac

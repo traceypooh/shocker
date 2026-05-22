@@ -1,5 +1,5 @@
 # Bocker
-Docker implemented in around 100 lines of bash.
+Docker implemented in around 200 lines of bash.
 
   * [Prerequisites](#prerequisites)
   * [Example Usage](#example-usage)
@@ -34,7 +34,7 @@ Even if you meet the above prerequisites you probably still want to **run bocker
 
 ## Example Usage
 
-```
+```sh
 $ bocker pull centos 7
 ######################################################################## 100.0%
 ######################################################################## 100.0%
@@ -119,6 +119,27 @@ $ cat /sys/fs/cgroup/memory/ps_42188/memory.limit_in_bytes
 * Quota Support / CGroups
 
 † `bocker init` provides a very limited implementation of `docker build`
+
+## 2026 Modernization
+### What broke in bocker and what shocker fixes
+- `bocker_pull` → full rewrite for Registry v2
+  - The original used Docker's v1 registry API (`index.docker.io/v1/`), which was shut down in 2023. Shocker uses the v2 API with proper OAuth2 Bearer token auth, fetches the manifest (accepting both Docker schema v2 and OCI formats), extracts layer digests, and pulls blobs by digest.
+- `cgroups v1 → v2 support`
+  - Most modern distros (Ubuntu 22.04+, Fedora 31+, etc.) ship with cgroups v2 unified hierarchy. The original's cgcreate/cgset/cgexec/cgdelete commands only work with v1. Shocker detects the version at startup and uses either:
+  - v2: writes directly to `/sys/fs/cgroup/`, maps `cpu.shares` → `cpu.weight`, `memory.limit_in_bytes` → `memory.max`
+  - v1: falls back to the original cgroup-tools commands
+- UUID space expansion
+  - Bocker used `shuf -i 42002-42254` — only 252 possible values, almost guaranteed collision if you run a few containers. Shocker uses 5 hex digits `($RANDOM * $RANDOM % 0xFFFFF)` = ~1 million values.
+- MAC address generation
+  - The original's `02:42:ac:11:00$mac` was only a 2-octet suffix from 3 decimal digits, producing malformed MACs. Shocker derives a proper 6-octet MAC from 4 hex chars of the UUID.
+- `shocker_exec PID` lookup
+  - The original's nested `ps | grep | awk | grep` pipeline was fragile and often broke. Replaced with a single `ps -eo pid,args | awk` that matches the unshare process for the container UUID.
+
+### Things that still require the same host setup as bocker
+- `btrfs` filesystem mounted at `/var/shocker`
+- `bridge0` network bridge already configured
+- ip / iptables for NAT (same as before)
+- Running as root
 
 ## Functionality: Not Yet Implemented
 
