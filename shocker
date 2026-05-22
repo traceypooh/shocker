@@ -29,7 +29,7 @@ fi
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 function _uuid() {
-  # 5-digit hex suffix → 1,048,576 possible values vs bocker's 252
+  # 5-digit hex suffix → 1,048,576 possible values vs shocker's 252
   printf '%05x' "$((RANDOM * RANDOM % 0xFFFFF))"
 }
 
