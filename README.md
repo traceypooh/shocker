@@ -19,21 +19,17 @@ The following packages are needed to run shocker.
 * iproute2
 * iptables
 * libcgroup-tools
-* util-linux >= 2.25.2
-* coreutils >= 7.5
-
-Because most distributions do not ship a new enough version of util-linux you will probably need to grab the sources from [here](https://www.kernel.org/pub/linux/utils/util-linux/v2.25/) and compile it yourself.
+* util-linux
+* coreutils
 
 Additionally your system will need to be configured with the following:
 
-* A btrfs filesystem mounted under `/var/shocker`
-* A network bridge called `bridge0` and an IP of 10.0.0.1/24
+* A `btrfs` filesystem mounted under `/var/shocker` (see below for setup help)
+* A network bridge called `bridge0` and an IP of 10.0.0.1/24 (gets created if missing)
 * IP forwarding enabled in `/proc/sys/net/ipv4/ip_forward`
 * A firewall routing traffic from `bridge0` to a physical interface.
 
-For ease of use a Vagrantfile is included which will build the needed environment.
-
-Even if you meet the above prerequisites you probably still want to **run shocker in a virtual machine**. shocker runs as root and among other things needs to make changes to your network interfaces, routing table, and firewall rules. **I can make no guarantees that it won't trash your system**.
+Even if you meet the above prerequisites you probably still want to **run shocker in a virtual machine**. shocker runs as `root` and among other things needs to make changes to your network interfaces, routing table, and firewall rules. **I can make no guarantees that it won't trash your system**.
 
 ## Example Usage
 
@@ -154,17 +150,17 @@ $ cat /sys/fs/cgroup/memory/ps_42188/memory.limit_in_bytes
 - cgroups v2 support with proper quoting in `_cg_exec`
 - --mount-proc=<path> fix for proc inside chroot
 
-## Fourth pass of fixes/improvements
+### Fourth pass of fixes/improvements
 - `run --rm` and `run -it` new optional CLI flags features working
 - switch DNS resolver from google to cloudflare
 - check `btrfs` for non-help screens
 - all commands working 🎉🚀
 
 ### Things that still require the same host setup as bocker
-- `btrfs` filesystem mounted at `/var/shocker`
-- `bridge0` network bridge already configured
-- ip / iptables for NAT (same as before)
-- Running as root
+- `btrfs` filesystem mounted at `/var/shocker` (see below)
+- `bridge0` network bridge already configured (or gets created)
+- ip / `iptables` for NAT (same as before)
+- Running as root 🤠
 
 ## btrfs /var/shocker setup
 ```sh
@@ -214,3 +210,61 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+## Understanding containers from scratch
+curious to run just `chroot`?
+
+```sh
+# setup a chroot dir (*everything* has to get copied in)
+mkdir /tmp/myimg
+echo hello > /tmp/myimg/hello.txt
+
+# see what shared libs each binary needs (linux-vdso is virtual — kernel provides it, no file to copy)
+BINS=(/bin/sh /bin/cat /bin/echo)
+for b in "${BINS[@]}"; do ldd "$b"; done
+
+# mirror each lib's directory structure into the chroot, then copy
+for b in "${BINS[@]}"; do ldd "$b" | grep -Eo '/[^ ]+'; done | sort -u | \
+while IFS= read -r lib; do
+  mkdir -p "/tmp/myimg$(dirname "$lib")"
+  cp "$lib" "/tmp/myimg$lib"
+done
+
+# copy the binaries themselves
+mkdir -p /tmp/myimg/bin
+cp "${BINS[@]}" /tmp/myimg/bin/
+
+# mount proc so the shell isn't blind, then drop in
+mkdir -p /tmp/myimg/proc
+mount -t proc proc /tmp/myimg/proc
+chroot /tmp/myimg /bin/sh
+# exit to leave
+
+# cleanup
+umount /tmp/myimg/proc
+```
+
+### example run:
+```sh
+...
+chroot /tmp/myimg /bin/sh
+mount: (hint) your fstab has been modified, but systemd still uses
+       the old version; use 'systemctl daemon-reload' to reload.
+# cat hello.txt
+hello
+# echo hai
+hai
+# exit
+```
+
+### example layout:
+```sh
+find /tmp/myimg -type f |sort
+/tmp/myimg/bin/cat
+/tmp/myimg/bin/echo
+/tmp/myimg/bin/sh
+/tmp/myimg/hello.txt
+/tmp/myimg/lib64/ld-linux-x86-64.so.2
+/tmp/myimg/lib/x86_64-linux-gnu/libc.so.6
+```
