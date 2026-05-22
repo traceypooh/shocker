@@ -1,5 +1,5 @@
 # shocker
-Docker implemented in around 300 lines of bash.
+Docker implemented in around 300 lines of bash 🧨
 
 Fork of bocker (github.com/p8952/bocker) updated for 2026.
 
@@ -144,7 +144,7 @@ $ cat /sys/fs/cgroup/memory/ps_42188/memory.limit_in_bytes
 - **`shocker_pull` — manifest list handling** — now accepts manifest list / OCI image index media types, detects which type was returned, then resolves to the correct platform digest (matching `uname -m` normalized to OCI arch names: `amd64`, `arm64`, `arm`) before fetching the actual image manifest; fixes accidentally pulling layers for the wrong architecture
 - **`shocker_pull` — config blob fix** — switched from `grep` on raw JSON to `python3` parsing `layers[]` explicitly; the config blob lives under `config` not `layers`, so the old grep was incorrectly including it and causing `tar` to fail on a non-tarball
 
-### Third pass of fixes (working pull/ps/run)
+### Third pass of fixes
 - Default tag to `:latest` when omitted
 - Registry v2 API with multi-arch manifest list support
 - `SHOCKER_REGISTRY` env var for Nexus/mirror pull-through (see below)
@@ -154,6 +154,11 @@ $ cat /sys/fs/cgroup/memory/ps_42188/memory.limit_in_bytes
 - cgroups v2 support with proper quoting in `_cg_exec`
 - --mount-proc=<path> fix for proc inside chroot
 
+## Fourth pass of fixes/improvements
+- `run --rm` and `run -it` new optional CLI flags features working
+- switch DNS resolver from google to cloudflare
+- check `btrfs` for non-help screens
+- all commands working 🎉🚀
 
 ### Things that still require the same host setup as bocker
 - `btrfs` filesystem mounted at `/var/shocker`

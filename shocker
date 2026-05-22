@@ -12,12 +12,6 @@ btrfs_path='/var/shocker'
 # cgroups v1 legacy controllers (used only if cgroupsv2 is absent)
 cgroups_v1='cpu,cpuacct,memory'
 
-# Ensure the btrfs root exists (user must have a btrfs filesystem mounted here)
-if [[ ! -d "$btrfs_path" ]]; then
-  echo "mount a btrfs filesystem at $btrfs_path first - see REAMDE.md for suggestion"
-  exit 1
-fi
-
 [[ $# -gt 0 ]] && while [ "${1:0:2}" == '--' ]; do
   OPTION=${1:2}
   [[ $OPTION =~ = ]] && declare "SHOCKER_${OPTION/=*/}=${OPTION/*=/}" \
@@ -37,6 +31,14 @@ fi
 function _uuid() {
   # 5-digit hex suffix → 1,048,576 possible values vs bocker's 252
   printf '%05x' "$((RANDOM * RANDOM % 0xFFFFF))"
+}
+
+function btrfs_check() {
+  # Ensure the btrfs root exists (user must have a btrfs filesystem mounted here)
+  if [[ ! -d "$btrfs_path" ]]; then
+    echo "mount a btrfs filesystem at $btrfs_path first - see REAMDE.md for suggestion"
+    exit 1
+  fi
 }
 
 function shocker_check() {
@@ -241,7 +243,18 @@ function shocker_ps() { #HELP List containers:\nSHOCKER ps
   done
 }
 
-function shocker_run() { #HELP Create a container:\nSHOCKER run <image_id> <command>
+function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <image_id> [command]
+  # Parse flags
+  local interactive=0 do_rm=0
+  while [[ "${1:-}" == -* ]]; do
+    case "$1" in
+      -i|-t|-it|-ti) interactive=1 ;;
+      --rm) do_rm=1 ;;
+      *) echo "Unknown flag: $1" && exit 1 ;;
+    esac
+    shift
+  done
+
   # One-time bridge + NAT setup (survives until reboot; harmless if already exists)
   if ! ip link show bridge0 &>/dev/null; then
     ip link add name bridge0 type bridge
@@ -251,11 +264,19 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run <image_id> <comm
     iptables -t nat -A POSTROUTING -s 10.0.0.0/24 ! -o bridge0 -j MASQUERADE
   fi
 
-  local uuid="ps_$(_uuid)"
+  # UUID conflict: loop rather than recurse (recursion would lose parsed flags)
+  local uuid
+  while true; do
+    uuid="ps_$(_uuid)"
+    [[ "$(shocker_check "$uuid")" == 1 ]] && break
+    echo "UUID conflict, retrying…"
+  done
+
   [[ "$(shocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
-  [[ "$(shocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying…" && shocker_run "$@" && return
 
   local cmd="${*:2}"
+  [[ -z "$cmd" && $interactive -eq 1 ]] && cmd='/bin/sh'
+  [[ -z "$cmd" ]] && echo "No command specified" && exit 1
   # Derive IP from full 5-hex-digit UUID value (1–253) to minimize collision
   local hex="${uuid#ps_}"
   local suffix; suffix=$(( 16#${hex} % 253 + 1 ))
@@ -276,21 +297,34 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run <image_id> <comm
   ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
 
   btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$uuid" > /dev/null
-  echo 'nameserver 8.8.8.8' > "$btrfs_path/$uuid/etc/resolv.conf"
+  mkdir -p "$btrfs_path/$uuid/etc"
+  # use cloudflare's privacy-oriented DNS resolver
+  echo 'nameserver 1.1.1.1' > "$btrfs_path/$uuid/etc/resolv.conf"
   echo "$cmd" > "$btrfs_path/$uuid/$uuid.cmd"
 
   _cg_create "$uuid"
   _cg_set    "$uuid"
 
-  _cg_exec "$uuid" \
-    ip netns exec netns_"$uuid" \
-    unshare -fmuip --mount-proc="$btrfs_path/$uuid/proc" \
-    chroot "$btrfs_path/$uuid" \
-    /bin/sh -c "$cmd" \
-    2>&1 | tee "$btrfs_path/$uuid/$uuid.log" || true
+  if [[ $interactive -eq 1 ]]; then
+    # Interactive: inherit the caller's PTY — no tee, stdin flows through naturally
+    _cg_exec "$uuid" \
+      ip netns exec netns_"$uuid" \
+      unshare -fmuip --mount-proc="$btrfs_path/$uuid/proc" \
+      chroot "$btrfs_path/$uuid" \
+      /bin/sh -c "$cmd" || true
+  else
+    _cg_exec "$uuid" \
+      ip netns exec netns_"$uuid" \
+      unshare -fmuip --mount-proc="$btrfs_path/$uuid/proc" \
+      chroot "$btrfs_path/$uuid" \
+      /bin/sh -c "$cmd" \
+      2>&1 | tee "$btrfs_path/$uuid/$uuid.log" || true
+  fi
 
   ip link del dev veth0_"$uuid"
   ip netns del netns_"$uuid"
+
+  [[ $do_rm -eq 1 ]] && shocker_rm "$uuid"
 }
 
 function shocker_exec() { #HELP Execute a command in a running container:\nSHOCKER exec <container_id> <command>
@@ -317,7 +351,7 @@ function shocker_commit() { #HELP Commit a container to an image:\nSHOCKER commi
 }
 
 function shocker_help() { #HELP Display this message:\nSHOCKER help
-  sed -n "s/^.*#HELP\\s//p;" < "$1" | sed "s/\\\\n/\n\t/g;s/$/\n/;s!SHOCKER!${1/!/\\!}!g"
+  grep '^function.*#HELP' "$1" | sed "s/^.*#HELP //;s/\\\\n/\n\t/g;s/$/\n/;s!SHOCKER!${1/!/\\!}!g"
 }
 
 # ── dispatch ─────────────────────────────────────────────────────────────────
@@ -325,6 +359,6 @@ function shocker_help() { #HELP Display this message:\nSHOCKER help
 [[ -z "${1-}" ]] && shocker_help "$0" && exit 0
 
 case $1 in
-  pull|init|rm|images|ps|run|exec|logs|commit) shocker_"$1" "${@:2}" ;;
+  pull|init|rm|images|ps|run|exec|logs|commit) btrfs_check; shocker_"$1" "${@:2}" ;;
   *) shocker_help "$0" ;;
 esac
