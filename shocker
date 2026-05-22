@@ -29,7 +29,7 @@ fi
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 function _uuid() {
-  # 5-digit hex suffix → 1,048,576 possible values vs shocker's 252
+  # 5-digit hex suffix → 1,048,576 possible values vs bocker's 252
   printf '%05x' "$((RANDOM * RANDOM % 0xFFFFF))"
 }
 
@@ -110,25 +110,64 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   [[ -z "$token" ]] && echo "Failed to authenticate for '$name'" && exit 1
 
   local registry='https://registry-1.docker.io/v2'
+  local arch; arch="$(uname -m)"
+  # Normalise arch to OCI/Docker naming
+  case "$arch" in
+    x86_64)  arch='amd64' ;;
+    aarch64) arch='arm64' ;;
+    armv7l)  arch='arm'   ;;
+  esac
 
-  # Fetch manifest (prefer OCI / schema v2 manifests)
-  local manifest
+  # Fetch manifest — may be a manifest list (multi-arch index) or a single manifest
+  local manifest media_type
   manifest="$(curl -fsSL \
     -H "Authorization: Bearer $token" \
+    -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+    -H 'Accept: application/vnd.oci.image.index.v1+json' \
     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
     -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
     "$registry/$name/manifests/$tag")"
+  media_type="$(echo "$manifest" | grep -o '"mediaType":"[^"]*"' | head -1 | cut -d'"' -f4)"
 
-  # Extract layer digests (works for both OCI and Docker schema v2)
+  # If we got a manifest list / image index, resolve to the right platform manifest
+  if [[ "$media_type" == *"manifest.list"* || "$media_type" == *"image.index"* ]]; then
+    # Find the digest for our platform (match arch, prefer linux os)
+    local target_digest
+    target_digest="$(echo "$manifest" \
+      | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+arch = '${arch}'
+for m in data.get('manifests', []):
+    p = m.get('platform', {})
+    if p.get('architecture') == arch and p.get('os', 'linux') == 'linux':
+        print(m['digest'])
+        break
+" 2>/dev/null)"
+    [[ -z "$target_digest" ]] && echo "No image for arch '$arch' in '$name:$tag'" && exit 1
+    manifest="$(curl -fsSL \
+      -H "Authorization: Bearer $token" \
+      -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+      -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+      "$registry/$name/manifests/$target_digest")"
+  fi
+
+  # Extract only layer digests (exclude the config blob which is not a tarball)
   local layers
-  layers="$(echo "$manifest" | grep -o '"digest":"sha256:[^"]*"' | cut -d'"' -f4)"
+  layers="$(echo "$manifest" \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for l in data.get('layers', []):
+    print(l['digest'])
+" 2>/dev/null)"
   [[ -z "$layers" ]] && echo "No image '$name:$tag' found or unsupported manifest" && exit 1
 
   local tmp_uuid; tmp_uuid="$(uuidgen)"
   mkdir /tmp/"$tmp_uuid"
 
   while IFS= read -r digest; do
-    echo "Pulling layer ${digest:7:12}…"
+    echo "Pulling layer ${digest:7:19}…"
     curl -fsSL \
       -H "Authorization: Bearer $token" \
       "$registry/$name/blobs/$digest" \
@@ -169,11 +208,12 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run <image_id> <comm
   [[ "$(shocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying…" && shocker_run "$@" && return
 
   local cmd="${*:2}"
-  # Derive a stable /24 IP from last two hex digits of UUID (1–254)
-  local suffix; suffix=$(( 16#${uuid: -2} % 253 + 1 ))
+  # Derive IP from full 5-hex-digit UUID value (1–253) to minimize collision
+  local suffix; suffix=$(( 16#${uuid} % 253 + 1 ))
   local ip="10.0.0.$suffix"
-  # Proper 6-octet MAC derived from UUID
-  local mac; mac="02:42:$(echo "${uuid: -8}" | sed 's/.\{2\}/&:/g;s/:$//')"
+  # Proper 6-octet MAC: fixed OUI 02:42 + 4 hex digits zero-padded from UUID
+  local u8; u8="$(printf '%08x' "$((16#${uuid}))")"
+  local mac="02:42:${u8:0:2}:${u8:2:2}:${u8:4:2}:${u8:6:2}"
 
   ip link add dev veth0_"$uuid" type veth peer name veth1_"$uuid"
   ip link set dev veth0_"$uuid" up
