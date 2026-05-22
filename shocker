@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shocker — Docker implemented in ~200 lines of bash
+# shocker — Docker implemented in ~300 lines of bash
 # Fork of bocker (github.com/p8952/bocker) updated for 2026:
 #   - Docker Registry v2 API (v1 was shut down in 2023)
 #   - cgroups v2 support with v1 fallback
@@ -11,6 +11,12 @@ set -o errexit -o nounset -o pipefail; shopt -s nullglob
 btrfs_path='/var/shocker'
 # cgroups v1 legacy controllers (used only if cgroupsv2 is absent)
 cgroups_v1='cpu,cpuacct,memory'
+
+# Ensure the btrfs root exists (user must have a btrfs filesystem mounted here)
+if [[ ! -d "$btrfs_path" ]]; then
+  echo "mount a btrfs filesystem at $btrfs_path first - see REAMDE.md for suggestion"
+  exit 1
+fi
 
 [[ $# -gt 0 ]] && while [ "${1:0:2}" == '--' ]; do
   OPTION=${1:2}
@@ -67,14 +73,16 @@ function _cg_exec() { # <id> <cmd…>
   local id=$1; shift
   if [[ $CGROUP_VERSION -eq 2 ]]; then
     # Write shell PID into cgroup, then exec (cgexec not available for v2)
+    # $1=cgroup.procs path, ${@:2}=actual command — exec preserves all quoting
     local cgroot=/sys/fs/cgroup/"$id"
-    bash -c "echo \$$ > ${cgroot}/cgroup.procs && exec $*"
+    bash -c 'echo $$ > "$1" && exec "${@:2}"' -- "${cgroot}/cgroup.procs" "$@"
   else
     cgexec -g "$cgroups_v1:$id" "$@"
   fi
 }
 
 function _cg_delete() { # <id>
+  local id=$1
   if [[ $CGROUP_VERSION -eq 2 ]]; then
     rmdir /sys/fs/cgroup/"$id" 2>/dev/null || true
   else
@@ -97,19 +105,33 @@ function shocker_init() { #HELP Create an image from a directory:\nSHOCKER init 
   fi
 }
 
-function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER pull <name> <tag>
-  local name=$1 tag=$2
-  # Resolve official images (e.g. "ubuntu") to library/ubuntu
+function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER pull <name> [tag]
+  # Set SHOCKER_REGISTRY=host:port to use a pull-through mirror (e.g. Nexus).
+  # The mirror serves blobs directly so no CDN redirect issues; HTTP is assumed for
+  # non-standard ports. Docker Hub is used when SHOCKER_REGISTRY is unset.
+  local name=$1 tag=${2:-latest}
+  # Resolve official images (e.g. "alpine") to library/alpine
   [[ "$name" != */* ]] && name="library/$name"
 
-  # Authenticate — Docker Hub v2 token flow
-  local token
-  token="$(curl -fsSL \
-    "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
-    | grep -o '"token":"[^"]*"' | cut -d'"' -f4)"
-  [[ -z "$token" ]] && echo "Failed to authenticate for '$name'" && exit 1
+  local registry token=''
+  local -a auth_hdr=()   # populated only when using Docker Hub token auth
 
-  local registry='https://registry-1.docker.io/v2'
+  if [[ -n "${SHOCKER_REGISTRY:-}" ]]; then
+    # Mirror (e.g. Nexus): anonymous pull, blobs served directly, HTTP for non-443 ports
+    local scheme='https'
+    local port="${SHOCKER_REGISTRY##*:}"
+    [[ "$SHOCKER_REGISTRY" == *:* && "$port" != "443" ]] && scheme='http'
+    registry="${scheme}://${SHOCKER_REGISTRY}/v2"
+  else
+    # Docker Hub: obtain a bearer token first
+    registry='https://registry-1.docker.io/v2'
+    token="$(curl -fsSL \
+      "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
+      | grep -o '"token":"[^"]*"' | cut -d'"' -f4)"
+    [[ -z "$token" ]] && echo "Failed to authenticate for '$name'" && exit 1
+    auth_hdr=(-H "Authorization: Bearer $token")
+  fi
+
   local arch; arch="$(uname -m)"
   # Normalise arch to OCI/Docker naming
   case "$arch" in
@@ -119,18 +141,22 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   esac
 
   # Fetch manifest — may be a manifest list (multi-arch index) or a single manifest
-  local manifest media_type
+  local manifest
   manifest="$(curl -fsSL \
-    -H "Authorization: Bearer $token" \
+    "${auth_hdr[@]}" \
     -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
     -H 'Accept: application/vnd.oci.image.index.v1+json' \
     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
     -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
     "$registry/$name/manifests/$tag")"
-  media_type="$(echo "$manifest" | grep -o '"mediaType":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  # Detect manifest list / OCI image index by the presence of a top-level "manifests" array
+  # (don't grep mediaType — the inner per-manifest entries appear first and fool head -1)
+  local is_index
+  is_index="$(echo "$manifest" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print('1' if 'manifests' in d else '0')" 2>/dev/null)"
 
   # If we got a manifest list / image index, resolve to the right platform manifest
-  if [[ "$media_type" == *"manifest.list"* || "$media_type" == *"image.index"* ]]; then
+  if [[ "$is_index" == "1" ]]; then
     # Find the digest for our platform (match arch, prefer linux os)
     local target_digest
     target_digest="$(echo "$manifest" \
@@ -146,7 +172,7 @@ for m in data.get('manifests', []):
 " 2>/dev/null)"
     [[ -z "$target_digest" ]] && echo "No image for arch '$arch' in '$name:$tag'" && exit 1
     manifest="$(curl -fsSL \
-      -H "Authorization: Bearer $token" \
+      "${auth_hdr[@]}" \
       -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
       -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
       "$registry/$name/manifests/$target_digest")"
@@ -163,20 +189,33 @@ for l in data.get('layers', []):
 " 2>/dev/null)"
   [[ -z "$layers" ]] && echo "No image '$name:$tag' found or unsupported manifest" && exit 1
 
-  local tmp_uuid; tmp_uuid="$(uuidgen)"
-  mkdir /tmp/"$tmp_uuid"
+  local tmp_dir; tmp_dir="$(mktemp -d)"
 
   while IFS= read -r digest; do
     echo "Pulling layer ${digest:7:19}…"
-    curl -fsSL \
-      -H "Authorization: Bearer $token" \
-      "$registry/$name/blobs/$digest" \
-      -o /tmp/"$tmp_uuid"/layer.tar
-    tar xf /tmp/"$tmp_uuid"/layer.tar -C /tmp/"$tmp_uuid" && rm /tmp/"$tmp_uuid"/layer.tar
+    if [[ -z "${SHOCKER_REGISTRY:-}" ]]; then
+      # Docker Hub redirects blob downloads to a CDN (CloudFront/S3).
+      # Capture the redirect URL without following it, then download directly
+      # (--noproxy) — the signed URL has auth in query params, no header needed.
+      local cdn_url
+      cdn_url="$(curl -sw '%{redirect_url}' -o /dev/null \
+        "${auth_hdr[@]}" \
+        "$registry/$name/blobs/$digest")"
+      if [[ -n "$cdn_url" ]]; then
+        curl -fsSL --noproxy '*' "$cdn_url" -o "$tmp_dir/layer.tar" \
+          || { echo "Layer download failed — CDN unreachable directly. Set SHOCKER_REGISTRY to a pull-through mirror (e.g. nexus.us.archive.org:8080)." && exit 1; }
+      else
+        curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest" -o "$tmp_dir/layer.tar"
+      fi
+    else
+      # Mirror (Nexus etc.): blobs served directly, no CDN redirect
+      curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest" -o "$tmp_dir/layer.tar"
+    fi
+    tar xf "$tmp_dir/layer.tar" -C "$tmp_dir" && rm "$tmp_dir/layer.tar"
   done <<< "$layers"
 
-  echo "$1:$2" > /tmp/"$tmp_uuid"/img.source
-  shocker_init /tmp/"$tmp_uuid" && rm -rf /tmp/"$tmp_uuid"
+  echo "$1:$tag" > "$tmp_dir/img.source"
+  shocker_init "$tmp_dir" && rm -rf "$tmp_dir"
 }
 
 function shocker_rm() { #HELP Delete an image or container:\nSHOCKER rm <image_id or container_id>
@@ -203,16 +242,26 @@ function shocker_ps() { #HELP List containers:\nSHOCKER ps
 }
 
 function shocker_run() { #HELP Create a container:\nSHOCKER run <image_id> <command>
+  # One-time bridge + NAT setup (survives until reboot; harmless if already exists)
+  if ! ip link show bridge0 &>/dev/null; then
+    ip link add name bridge0 type bridge
+    ip addr add 10.0.0.1/24 dev bridge0
+    ip link set bridge0 up
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    iptables -t nat -A POSTROUTING -s 10.0.0.0/24 ! -o bridge0 -j MASQUERADE
+  fi
+
   local uuid="ps_$(_uuid)"
   [[ "$(shocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
   [[ "$(shocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying…" && shocker_run "$@" && return
 
   local cmd="${*:2}"
   # Derive IP from full 5-hex-digit UUID value (1–253) to minimize collision
-  local suffix; suffix=$(( 16#${uuid} % 253 + 1 ))
+  local hex="${uuid#ps_}"
+  local suffix; suffix=$(( 16#${hex} % 253 + 1 ))
   local ip="10.0.0.$suffix"
   # Proper 6-octet MAC: fixed OUI 02:42 + 4 hex digits zero-padded from UUID
-  local u8; u8="$(printf '%08x' "$((16#${uuid}))")"
+  local u8; u8="$(printf '%08x' "$((16#${hex}))")"
   local mac="02:42:${u8:0:2}:${u8:2:2}:${u8:4:2}:${u8:6:2}"
 
   ip link add dev veth0_"$uuid" type veth peer name veth1_"$uuid"
@@ -235,9 +284,9 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run <image_id> <comm
 
   _cg_exec "$uuid" \
     ip netns exec netns_"$uuid" \
-    unshare -fmuip --mount-proc \
+    unshare -fmuip --mount-proc="$btrfs_path/$uuid/proc" \
     chroot "$btrfs_path/$uuid" \
-    /bin/sh -c "/bin/mount -t proc proc /proc && $cmd" \
+    /bin/sh -c "$cmd" \
     2>&1 | tee "$btrfs_path/$uuid/$uuid.log" || true
 
   ip link del dev veth0_"$uuid"

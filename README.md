@@ -1,5 +1,5 @@
 # shocker
-Docker implemented in around 200 lines of bash.
+Docker implemented in around 300 lines of bash.
 
 Fork of bocker (github.com/p8952/bocker) updated for 2026.
 
@@ -15,6 +15,7 @@ The following packages are needed to run shocker.
 
 * btrfs-progs
 * curl
+* python3
 * iproute2
 * iptables
 * libcgroup-tools
@@ -143,12 +144,48 @@ $ cat /sys/fs/cgroup/memory/ps_42188/memory.limit_in_bytes
 - **`shocker_pull` — manifest list handling** — now accepts manifest list / OCI image index media types, detects which type was returned, then resolves to the correct platform digest (matching `uname -m` normalized to OCI arch names: `amd64`, `arm64`, `arm`) before fetching the actual image manifest; fixes accidentally pulling layers for the wrong architecture
 - **`shocker_pull` — config blob fix** — switched from `grep` on raw JSON to `python3` parsing `layers[]` explicitly; the config blob lives under `config` not `layers`, so the old grep was incorrectly including it and causing `tar` to fail on a non-tarball
 
+### Third pass of fixes (working pull/ps/run)
+- Default tag to `:latest` when omitted
+- Registry v2 API with multi-arch manifest list support
+- `SHOCKER_REGISTRY` env var for Nexus/mirror pull-through (see below)
+- Two-step CDN blob download to work around proxy allowlists
+- `btrfs` check with setup instructions (see below)
+- `bridge0` + NAT auto-created on first run
+- cgroups v2 support with proper quoting in `_cg_exec`
+- --mount-proc=<path> fix for proc inside chroot
+
 
 ### Things that still require the same host setup as bocker
 - `btrfs` filesystem mounted at `/var/shocker`
 - `bridge0` network bridge already configured
 - ip / iptables for NAT (same as before)
 - Running as root
+
+## btrfs /var/shocker setup
+```sh
+# 1. Install btrfs tools if needed
+apt install -y btrfs-progs   # Debian/Ubuntu
+
+# 2. Create a sparse 10G image file (sparse = no real disk used until written)
+truncate -s 10G /var/shocker.img
+
+# 3. Format it
+mkfs.btrfs /var/shocker.img
+
+# 4. Mount it
+mkdir -p /var/shocker
+mount -o loop /var/shocker.img /var/shocker
+
+# 5. Persist across reboots
+echo '/var/shocker.img /var/shocker btrfs loop 0 0' >> /etc/fstab
+```
+
+## proxy
+If your setup requires a http proxy to access docker hub (etc.) you can set that up esp. for
+the `shocker pull` like this:
+```sh
+SHOCKER_REGISTRY=example.com:8080 shocker pull alpine
+```
 
 ## Functionality: Not Yet Implemented
 
