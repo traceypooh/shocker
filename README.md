@@ -1,5 +1,5 @@
 # shocker
-Docker implemented in around 300 lines of bash 🧨
+Docker implemented in around 300 lines of bash ⚡️
 
 Fork of bocker (github.com/p8952/bocker). updated for 2026.
 

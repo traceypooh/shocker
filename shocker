@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shocker — Docker implemented in ~300 lines of bash
+# shocker — Docker implemented in around 300 lines of bash ⚡️
 # Fork of bocker (github.com/p8952/bocker).  Updated for 2026.
 #   - Docker Registry v2 API (v1 was shut down in 2023)
 #   - cgroups v2 support with v1 fallback
