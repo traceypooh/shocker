@@ -1,7 +1,7 @@
 # shocker
 Docker implemented in around 300 lines of bash 🧨
 
-Fork of bocker (github.com/p8952/bocker) updated for 2026.
+Fork of bocker (github.com/p8952/bocker). updated for 2026.
 
   * [Prerequisites](#prerequisites)
   * [Example Usage](#example-usage)
@@ -18,7 +18,6 @@ The following packages are needed to run shocker.
 * python3
 * iproute2
 * iptables
-* libcgroup-tools
 * util-linux
 * coreutils
 
@@ -194,6 +193,7 @@ SHOCKER_REGISTRY=example.com:8080 shocker pull alpine
 ## License
 
 Copyright (C) 2015 Peter Wilmott
+Copyright (C) 2026 Tracey Jaquith
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

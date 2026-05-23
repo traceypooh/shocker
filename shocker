@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shocker — Docker implemented in ~300 lines of bash
-# Fork of bocker (github.com/p8952/bocker) updated for 2026:
+# Fork of bocker (github.com/p8952/bocker).  Updated for 2026.
 #   - Docker Registry v2 API (v1 was shut down in 2023)
 #   - cgroups v2 support with v1 fallback
 #   - Improved UUID space & MAC address generation
@@ -107,11 +107,16 @@ function shocker_init() { #HELP Create an image from a directory:\nSHOCKER init 
   fi
 }
 
-function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER pull <name> [tag]
+function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER pull <name[:tag]>
   # Set SHOCKER_REGISTRY=host:port to use a pull-through mirror (e.g. Nexus).
   # The mirror serves blobs directly so no CDN redirect issues; HTTP is assumed for
   # non-standard ports. Docker Hub is used when SHOCKER_REGISTRY is unset.
-  local name=$1 tag=${2:-latest}
+  local name tag
+  if [[ "$1" == *:* ]]; then
+    name="${1%%:*}" tag="${1##*:}"
+  else
+    name="$1" tag="${2:-latest}"
+  fi
   # Resolve official images (e.g. "alpine") to library/alpine
   [[ "$name" != */* ]] && name="library/$name"
 
