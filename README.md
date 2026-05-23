@@ -265,3 +265,15 @@ find /tmp/myimg -type f |sort
 /tmp/myimg/lib64/ld-linux-x86-64.so.2
 /tmp/myimg/lib/x86_64-linux-gnu/libc.so.6
 ```
+
+### direct chroot into a shocker image
+this will have file/dir isolation, but *not* process isolation (eg: `ps aux` shows host processes)
+
+```sh
+# pick some shocker image you have pulled and update this line:
+IMG=/var/shocker/img_0a690
+mount -t proc proc $IMG/proc
+chroot $IMG /bin/sh
+# play around ^, exit, then cleanup:
+umount $IMG/proc
+```

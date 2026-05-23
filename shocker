@@ -117,6 +117,7 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   else
     name="$1" tag="${2:-latest}"
   fi
+  local display="${name}:${tag}"
   # Resolve official images (e.g. "alpine") to library/alpine
   [[ "$name" != */* ]] && name="library/$name"
 
@@ -221,7 +222,7 @@ for l in data.get('layers', []):
     tar xf "$tmp_dir/layer.tar" -C "$tmp_dir" && rm "$tmp_dir/layer.tar"
   done <<< "$layers"
 
-  echo "$1:$tag" > "$tmp_dir/img.source"
+  echo "$display" > "$tmp_dir/img.source"
   shocker_init "$tmp_dir" && rm -rf "$tmp_dir"
 }
 
