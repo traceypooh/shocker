@@ -60,7 +60,7 @@ Removed: ps_58122
 /bin/sh: curl: not found
 Removed: ps_c3037
 
-> shocker run img_0c690 apk add curl
+> shocker run img_aa090 apk add curl
 (1/9) Installing brotli-libs (1.2.0-r0)
 (2/9) Installing c-ares (1.34.6-r0)
 (3/9) Installing libunistring (1.4.1-r0)
@@ -77,18 +77,18 @@ OK: 13.0 MiB in 25 packages
 CONTAINER_ID		COMMAND
 ps_19998		apk add curl
 
-> shocker commit ps_19998 img_0c690
-Removed: img_0c690
-Created: img_0c690
+> shocker commit ps_19998 img_aa090
+Removed: img_aa090
+Created: img_aa090
 
-> shocker run --rm img_0c690 which curl
+> shocker run --rm img_aa090 which curl
 /usr/bin/curl
 Removed: ps_42f9f
 
-> shocker run --rm -it img_0c690
+> shocker run --rm -it img_aa090
 / # ls
-bin           etc           img.source    media         opt           ps_19998.cmd  ps_ab245.cmd  run           srv           tmp           var
-dev           home          lib           mnt           proc          ps_19998.log  root          sbin          sys           usr
+bin         etc         img.source   media       opt         ps_19998.cmd  ps_ab245.cmd  run           srv         tmp         var
+dev         home        lib          mnt         proc        ps_19998.log  root          sbin          sys         usr
 / # date
 Fri May 22 23:54:38 UTC 2026
 / # exit
