@@ -34,73 +34,66 @@ Even if you meet the above prerequisites you probably still want to **run shocke
 ## Example Usage
 
 ```sh
-$ shocker pull centos 7
-######################################################################## 100.0%
-######################################################################## 100.0%
-######################################################################## 100.0%
-Created: img_42150
+> shocker pull alpine
+Pulling layer 6a0ac1617861a677b04…
+Created: img_aa090
 
-$ shocker images
-IMAGE_ID        SOURCE
-img_42150       centos:7
+> shocker images
+IMAGE_ID		SOURCE
+img_aa090		alpine:latest
 
-$ shocker run img_42150 cat /etc/centos-release
-CentOS Linux release 7.1.1503 (Core)
+> shocker run img_aa090 cat /etc/issue
+Welcome to Alpine Linux 3.23
+Kernel \r on \m (\l)
 
-$ shocker ps
-CONTAINER_ID       COMMAND
-ps_42045           cat /etc/centos-release
+> shocker ps
+CONTAINER_ID		COMMAND
+ps_58122		cat /etc/issue
 
-$ shocker logs ps_42045
-CentOS Linux release 7.1.1503 (Core)
+> shocker logs ps_58122
+Welcome to Alpine Linux 3.23
+Kernel \r on \m (\l)
 
-$ shocker rm ps_42045
-Removed: ps_42045
+> shocker rm ps_58122
+Removed: ps_58122
 
-$ shocker run img_42150 which wget
-which: no wget in (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/root/bin)
+> shocker run --rm img_aa090 curl
+/bin/sh: curl: not found
+Removed: ps_c3037
 
-$ shocker run img_42150 yum install -y wget
-Installing : wget-1.14-10.el7_0.1.x86_64                                  1/1
-Verifying  : wget-1.14-10.el7_0.1.x86_64                                  1/1
-Installed  : wget.x86_64 0:1.14-10.el7_0.1
-Complete!
+> shocker run img_0c690 apk add curl
+(1/9) Installing brotli-libs (1.2.0-r0)
+(2/9) Installing c-ares (1.34.6-r0)
+(3/9) Installing libunistring (1.4.1-r0)
+(4/9) Installing libidn2 (2.3.8-r0)
+(5/9) Installing nghttp2-libs (1.69.0-r0)
+(6/9) Installing libpsl (0.21.5-r3)
+(7/9) Installing zstd-libs (1.5.7-r2)
+(8/9) Installing libcurl (8.19.0-r0)
+(9/9) Installing curl (8.19.0-r0)
+Executing busybox-1.37.0-r30.trigger
+OK: 13.0 MiB in 25 packages
 
-$ shocker ps
-CONTAINER_ID       COMMAND
-ps_42018           yum install -y wget
-ps_42182           which wget
+> shocker ps
+CONTAINER_ID		COMMAND
+ps_19998		apk add curl
 
-$ shocker commit ps_42018 img_42150
-Removed: img_42150
-Created: img_42150
+> shocker commit ps_19998 img_0c690
+Removed: img_0c690
+Created: img_0c690
 
-$ shocker run img_42150 which wget
-/usr/bin/wget
+> shocker run --rm img_0c690 which curl
+/usr/bin/curl
+Removed: ps_42f9f
 
-$ shocker run img_42150 cat /proc/1/cgroup
-...
-4:memory:/ps_42152
-3:cpuacct,cpu:/ps_42152
-
-$ cat /sys/fs/cgroup/cpu/ps_42152/cpu.shares
-512
-
-$ cat /sys/fs/cgroup/memory/ps_42152/memory.limit_in_bytes
-512000000
-
-$ SHOCKER_CPU_SHARE=1024 \
-	SHOCKER_MEM_LIMIT=1024 \
-	shocker run img_42150 cat /proc/1/cgroup
-...
-4:memory:/ps_42188
-3:cpuacct,cpu:/ps_42188
-
-$ cat /sys/fs/cgroup/cpu/ps_42188/cpu.shares
-1024
-
-$ cat /sys/fs/cgroup/memory/ps_42188/memory.limit_in_bytes
-1024000000
+> shocker run --rm -it img_0c690
+/ # ls
+bin           etc           img.source    media         opt           ps_19998.cmd  ps_ab245.cmd  run           srv           tmp           var
+dev           home          lib           mnt           proc          ps_19998.log  root          sbin          sys           usr
+/ # date
+Fri May 22 23:54:38 UTC 2026
+/ # exit
+Removed: ps_9c548
 ```
 
 ## Functionality: Currently Implemented
@@ -155,6 +148,10 @@ $ cat /sys/fs/cgroup/memory/ps_42188/memory.limit_in_bytes
 - switch DNS resolver from google to cloudflare
 - check `btrfs` for non-help screens
 - all commands working 🎉🚀
+
+### Fifth pass of fixes/improvements
+- add `iptables` network forwarding so networking out inside containers works
+- use host `/etc/resolv.conf` since may have specific DNS resolving setup
 
 ### Things that still require the same host setup as bocker
 - `btrfs` filesystem mounted at `/var/shocker` (see below)

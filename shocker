@@ -263,6 +263,11 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <im
     echo 1 > /proc/sys/net/ipv4/ip_forward
     iptables -t nat -A POSTROUTING -s 10.0.0.0/24 ! -o bridge0 -j MASQUERADE
   fi
+  # Ensure FORWARD rules exist (survive reboots; idempotent via -C check)
+  iptables -C FORWARD -i bridge0 -j ACCEPT &>/dev/null \
+    || iptables -I FORWARD -i bridge0 -j ACCEPT
+  iptables -C FORWARD -o bridge0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &>/dev/null \
+    || iptables -I FORWARD -o bridge0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
   # UUID conflict: loop rather than recurse (recursion would lose parsed flags)
   local uuid
@@ -298,8 +303,10 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <im
 
   btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$uuid" > /dev/null
   mkdir -p "$btrfs_path/$uuid/etc"
-  # use cloudflare's privacy-oriented DNS resolver
-  echo 'nameserver 1.1.1.1' > "$btrfs_path/$uuid/etc/resolv.conf"
+
+  # use host DNS resolving
+  cp /etc/resolv.conf "$btrfs_path/$uuid/etc/resolv.conf"
+
   echo "$cmd" > "$btrfs_path/$uuid/$uuid.cmd"
 
   _cg_create "$uuid"
