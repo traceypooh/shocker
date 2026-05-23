@@ -337,7 +337,7 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <im
   ip link del dev veth0_"$uuid"
   ip netns del netns_"$uuid"
 
-  [[ $do_rm -eq 1 ]] && shocker_rm "$uuid"
+  [[ $do_rm -eq 1 ]] && shocker_rm "$uuid" > /dev/null
 }
 
 function shocker_exec() { #HELP Execute a command in a running container:\nSHOCKER exec <container_id> <command>

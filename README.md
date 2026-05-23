@@ -58,7 +58,6 @@ Removed: ps_58122
 
 > shocker run --rm img_aa090 curl
 /bin/sh: curl: not found
-Removed: ps_c3037
 
 > shocker run img_aa090 apk add curl
 (1/9) Installing brotli-libs (1.2.0-r0)
@@ -83,7 +82,6 @@ Created: img_aa090
 
 > shocker run --rm img_aa090 which curl
 /usr/bin/curl
-Removed: ps_42f9f
 
 > shocker run --rm -it img_aa090
 / # ls
@@ -92,7 +90,6 @@ dev         home        lib          mnt         proc        ps_19998.log  root 
 / # date
 Fri May 22 23:54:38 UTC 2026
 / # exit
-Removed: ps_9c548
 ```
 
 ## Functionality: Currently Implemented
