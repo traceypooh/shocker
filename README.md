@@ -28,7 +28,9 @@ Additionally your system will need to be configured with the following:
 * IP forwarding enabled in `/proc/sys/net/ipv4/ip_forward`
 * A firewall routing traffic from `bridge0` to a physical interface.
 
-Even if you meet the above prerequisites you probably still want to **run shocker in a virtual machine**. shocker runs as `root` and among other things needs to make changes to your network interfaces, routing table, and firewall rules. **I can make no guarantees that it won't trash your system**.
+Even if you meet the above prerequisites you probably still want to **run shocker in a virtual machine**. shocker runs as `root` and among other things needs to make changes to your network interfaces, routing table, and firewall rules.
+
+**We can make no guarantees that it won't trash your system**.
 
 ## Example Usage
 
@@ -189,8 +191,9 @@ SHOCKER_REGISTRY=example.com:8080 shocker pull alpine
 
 ## License
 
-Copyright (C) 2015 Peter Wilmott
 Copyright (C) 2026 Tracey Jaquith
+
+Copyright (C) 2015 Peter Wilmott
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -204,6 +207,18 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+## Control Groups (cgroups)
+We auto-detect cgroups v2 vs v1 and work with both.
+
+We limit each container by default to:
+- 512MB of memory
+  - you can change this by setting env var
+  - `SHOCKER_MEM_LIMIT` to something like 1024 (for 1GB)
+- 1024 cpu shares
+  - you can change this by setting env var `SHOCKER_CPU_SHARE`
+  - it's a soft limit - only kicks in when processes are competing for CPU
 
 
 ## Understanding containers from scratch

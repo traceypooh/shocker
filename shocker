@@ -57,7 +57,7 @@ function _cg_create() { # <id>
 
 function _cg_set() { # <id>
   local id=$1
-  : "${SHOCKER_CPU_SHARE:=512}"
+  : "${SHOCKER_CPU_SHARE:=1024}"
   : "${SHOCKER_MEM_LIMIT:=512}" # MiB
   if [[ $CGROUP_VERSION -eq 2 ]]; then
     # cgroupsv2: cpu.weight 1-10000 (roughly maps from v1 shares 2-262144)
