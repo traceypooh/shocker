@@ -21,14 +21,14 @@ The following packages are needed to run shocker.
 * util-linux
 * coreutils
 
-Additionally your system will need to be configured with the following:
+Additionally your system will need or gets configured with the following:
 
 * A `btrfs` filesystem mounted under `/var/shocker` (see below for setup help)
 * A network bridge called `bridge0` and an IP of 10.0.0.1/24 (gets created if missing)
-* IP forwarding enabled in `/proc/sys/net/ipv4/ip_forward`
-* A firewall routing traffic from `bridge0` to a physical interface.
+* IP forwarding enabled in `/proc/sys/net/ipv4/ip_forward` (gets created if missing)
+* `iptables` NAT and FORWARD rules for `bridge0` (gets created if missing)
 
-Even if you meet the above prerequisites you probably still want to **run shocker in a virtual machine**. shocker runs as `root` and among other things needs to make changes to your network interfaces, routing table, and firewall rules.
+You probably still want to **run shocker in a virtual machine**. `shocker` runs as `root` and among other things, makes changes to your network interfaces, routing table, and firewall rules.
 
 **We can make no guarantees that it won't trash your system**.
 
