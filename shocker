@@ -98,7 +98,7 @@ function _cg_delete() { # <id>
 # ── commands ─────────────────────────────────────────────────────────────────
 
 function shocker_init() { #HELP Create an image from a directory:\nSHOCKER init <directory>
-  local uuid="img_$(_uuid)"
+  local uuid="img-$(_uuid)"
   if [[ -d "$1" ]]; then
     [[ "$(shocker_check "$uuid")" == 0 ]] && shocker_run "$@"
     btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
@@ -111,9 +111,10 @@ function shocker_init() { #HELP Create an image from a directory:\nSHOCKER init 
 }
 
 function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER pull <name[:tag]>
-  # Set SHOCKER_REGISTRY=host:port to use a pull-through mirror (e.g. Nexus).
-  # The mirror serves blobs directly so no CDN redirect issues; HTTP is assumed for
-  # non-standard ports. Docker Hub is used when SHOCKER_REGISTRY is unset.
+  # SHOCKER_REGISTRY=host:port  — pull-through mirror or private registry.
+  # SHOCKER_REGISTRY_USER / SHOCKER_REGISTRY_PASS — credentials when the registry
+  #   issues a Bearer auth challenge (e.g. registry.example.com via git.example.com JWT).
+  # HTTP is assumed for non-443 ports; Docker Hub is used when SHOCKER_REGISTRY is unset.
   local name tag
   if [[ "$1" == *:* ]]; then
     name="${1%%:*}" tag="${1##*:}"
@@ -128,11 +129,29 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   local -a auth_hdr=()   # populated only when using Docker Hub token auth
 
   if [[ -n "${SHOCKER_REGISTRY:-}" ]]; then
-    # Mirror (e.g. Nexus): anonymous pull, blobs served directly, HTTP for non-443 ports
+    # Mirror or private registry: HTTP for non-443 ports, HTTPS otherwise
     local scheme='https'
     local port="${SHOCKER_REGISTRY##*:}"
     [[ "$SHOCKER_REGISTRY" == *:* && "$port" != "443" ]] && scheme='http'
     registry="${scheme}://${SHOCKER_REGISTRY}/v2"
+    # Probe for auth challenge (registry.example.com, self-hosted gitlabs might use Bearer JWT auth)
+    local www_auth
+    www_auth="$(curl -sI "$registry/$name/manifests/$tag" 2>/dev/null \
+      | grep -i '^www-authenticate:' | head -1 || true)"
+    if [[ -n "$www_auth" ]]; then
+      local realm svc scope
+      realm="$(echo "$www_auth" | grep -o 'realm="[^"]*"' | cut -d'"' -f2)"
+      svc="$(echo  "$www_auth" | grep -o 'service="[^"]*"' | cut -d'"' -f2)"
+      scope="repository:${name}:pull"
+      local -a cred_args=()
+      [[ -n "${SHOCKER_REGISTRY_USER:-}" ]] \
+        && cred_args=(-u "${SHOCKER_REGISTRY_USER}:${SHOCKER_REGISTRY_PASS:-}")
+      token="$(curl -fsSL "${cred_args[@]}" \
+        "${realm}?service=${svc}&scope=${scope}" \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('token','') or d.get('access_token',''))" \
+        2>/dev/null || true)"
+      [[ -n "$token" ]] && auth_hdr=(-H "Authorization: Bearer $token")
+    fi
   else
     # Docker Hub: obtain a bearer token first
     registry='https://registry-1.docker.io/v2'
@@ -200,33 +219,30 @@ for l in data.get('layers', []):
 " 2>/dev/null)"
   [[ -z "$layers" ]] && echo "No image '$name:$tag' found or unsupported manifest" && exit 1
 
-  local tmp_dir; tmp_dir="$(mktemp -d)"
+  # Create btrfs subvolume up front; pipe each layer blob directly into tar — zero /tmp usage.
+  local uuid="img-$(_uuid)"
+  btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
 
   while IFS= read -r digest; do
     echo "Pulling layer ${digest:7:19}…"
     if [[ -z "${SHOCKER_REGISTRY:-}" ]]; then
-      # Docker Hub redirects blob downloads to a CDN (CloudFront/S3).
-      # Capture the redirect URL without following it, then download directly
-      # (--noproxy) — the signed URL has auth in query params, no header needed.
       local cdn_url
       cdn_url="$(curl -sw '%{redirect_url}' -o /dev/null \
         "${auth_hdr[@]}" \
         "$registry/$name/blobs/$digest")"
       if [[ -n "$cdn_url" ]]; then
-        curl -fsSL --noproxy '*' "$cdn_url" -o "$tmp_dir/layer.tar" \
-          || { echo "Layer download failed — CDN unreachable directly. Set SHOCKER_REGISTRY to a pull-through mirror (e.g. nexus.us.archive.org:8080)." && exit 1; }
+        curl -fsSL --noproxy '*' "$cdn_url" \
+          || { echo "Layer download failed — CDN unreachable directly. Set SHOCKER_REGISTRY to a pull-through mirror." && exit 1; }
       else
-        curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest" -o "$tmp_dir/layer.tar"
+        curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest"
       fi
     else
-      # Mirror (Nexus etc.): blobs served directly, no CDN redirect
-      curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest" -o "$tmp_dir/layer.tar"
-    fi
-    tar xf "$tmp_dir/layer.tar" -C "$tmp_dir" && rm "$tmp_dir/layer.tar"
+      curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest"
+    fi | tar xf - -C "$btrfs_path/$uuid"
   done <<< "$layers"
 
-  echo "$display" > "$tmp_dir/img.source"
-  shocker_init "$tmp_dir" && rm -rf "$tmp_dir"
+  echo "$display" > "$btrfs_path/$uuid/img.source"
+  echo "Created: $uuid"
 }
 
 function shocker_rm() { #HELP Delete an image or container:\nSHOCKER rm <image_id or container_id>
@@ -238,7 +254,7 @@ function shocker_rm() { #HELP Delete an image or container:\nSHOCKER rm <image_i
 
 function shocker_images() { #HELP List images:\nSHOCKER images
   echo -e "IMAGE_ID\t\tSOURCE"
-  for img in "$btrfs_path"/img_*; do
+  for img in "$btrfs_path"/img-*; do
     img=$(basename "$img")
     echo -e "$img\t\t$(cat "$btrfs_path/$img/img.source")"
   done
@@ -246,7 +262,7 @@ function shocker_images() { #HELP List images:\nSHOCKER images
 
 function shocker_ps() { #HELP List containers:\nSHOCKER ps
   echo -e "CONTAINER_ID\t\tCOMMAND"
-  for ps in "$btrfs_path"/ps_*; do
+  for ps in "$btrfs_path"/ps-*; do
     ps=$(basename "$ps")
     echo -e "$ps\t\t$(cat "$btrfs_path/$ps/$ps.cmd")"
   done
@@ -283,19 +299,26 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v
   # UUID conflict: loop rather than recurse (recursion would lose parsed flags)
   local uuid
   while true; do
-    uuid="ps_$(_uuid)"
+    uuid="ps-$(_uuid)"
     [[ "$(shocker_check "$uuid")" == 1 ]] && break
     echo "UUID conflict, retrying…"
   done
 
   local img="$1"
+  # Allow "alpine" or "alpine:latest" — look up img-XXXXX by img.source content
+  if [[ "$img" != img-* && "$img" != ps-* ]]; then
+    local search="$img"; [[ "$img" != *:* ]] && search="$img:latest"
+    img=$(grep -rlx "$search" "$btrfs_path"/img-*/img.source 2>/dev/null \
+          | head -1 | xargs -r dirname | xargs -r basename) || true
+    [[ -z "$img" ]] && echo "No image named '$1' exists" && exit 1
+  fi
   [[ "$(shocker_check "$img")" == 1 ]] && echo "No image named '$img' exists" && exit 1
 
   local -a cmd_args=("${@:2}") # this is command plus all args
   [[ ${#cmd_args[@]} -eq 0 && $interactive -eq 1 ]] && cmd_args=('/bin/sh')
   [[ ${#cmd_args[@]} -eq 0 ]] && echo "No command specified" && exit 1
   # Derive IP from full 5-hex-digit UUID value (1–253) to minimize collision
-  local hex="${uuid#ps_}"
+  local hex="${uuid#ps-}"
   local suffix; suffix=$(( 16#${hex} % 253 + 1 ))
   local ip="10.0.0.$suffix"
   # Proper 6-octet MAC: fixed OUI 02:42 + 4 hex digits zero-padded from UUID

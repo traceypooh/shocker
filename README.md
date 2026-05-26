@@ -37,31 +37,31 @@ You probably still want to **run shocker in a virtual machine**. `shocker` runs 
 ```sh
 > shocker pull alpine
 Pulling layer 6a0ac1617861a677b04…
-Created: img_aa090
+Created: img-aa090
 
 > shocker images
 IMAGE_ID		SOURCE
-img_aa090		alpine:latest
+img-aa090		alpine:latest
 
-> shocker run img_aa090 cat /etc/issue
+> shocker run alpine cat /etc/issue
 Welcome to Alpine Linux 3.23
 Kernel \r on \m (\l)
 
 > shocker ps
 CONTAINER_ID		COMMAND
-ps_58122		cat /etc/issue
+ps-58122		cat /etc/issue
 
-> shocker logs ps_58122
+> shocker logs ps-58122
 Welcome to Alpine Linux 3.23
 Kernel \r on \m (\l)
 
-> shocker rm ps_58122
-Removed: ps_58122
+> shocker rm ps-58122
+Removed: ps-58122
 
-> shocker run --rm img_aa090 curl
+> shocker run --rm alpine curl
 /bin/sh: curl: not found
 
-> shocker run img_aa090 apk add curl
+> shocker run alpine apk add curl
 (1/9) Installing brotli-libs (1.2.0-r0)
 (2/9) Installing c-ares (1.34.6-r0)
 (3/9) Installing libunistring (1.4.1-r0)
@@ -76,19 +76,19 @@ OK: 13.0 MiB in 25 packages
 
 > shocker ps
 CONTAINER_ID		COMMAND
-ps_19998		apk add curl
+ps-19998		apk add curl
 
-> shocker commit ps_19998 img_aa090
-Removed: img_aa090
-Created: img_aa090
+> shocker commit ps-19998 img-aa090
+Removed: img-aa090
+Created: img-aa090
 
-> shocker run --rm img_aa090 which curl
+> shocker run --rm img-aa090 which curl
 /usr/bin/curl
 
-> shocker run --rm -it img_aa090
+> shocker run --rm -it img-aa090
 / # ls
-bin         etc         img.source   media       opt         ps_19998.cmd  ps_ab245.cmd  run           srv         tmp         var
-dev         home        lib          mnt         proc        ps_19998.log  root          sbin          sys         usr
+bin         etc         img.source   media       opt         ps-19998.cmd  ps-ab245.cmd  run           srv         tmp         var
+dev         home        lib          mnt         proc        ps-19998.log  root          sbin          sys         usr
 / # date
 Fri May 22 23:54:38 UTC 2026
 / # exit
@@ -108,7 +108,8 @@ Fri May 22 23:54:38 UTC 2026
 * Networking
 * Quota Support / CGroups
 
-† `shocker init` provides a very limited implementation of `docker build`
+† `shocker init` is a `docker import` equivalent — it promotes a local directory into a shocker image. For a proper build workflow, see [Building images](#building-images) below.
+
 
 ## 2026 Modernization
 ### What broke in bocker and what shocker fixes
@@ -176,12 +177,45 @@ mount -o loop /var/shocker.img /var/shocker
 echo '/var/shocker.img /var/shocker btrfs loop 0 0' >> /etc/fstab
 ```
 
-## proxy
-If your setup requires a http proxy to access docker hub (etc.) you can set that up esp. for
-the `shocker pull` like this:
+## Building images
+
+The recommended approach (equivalent to `docker build` with an interactive layer):
+
 ```sh
-SHOCKER_REGISTRY=example.com:8080 shocker pull alpine
+# 1. start a shell in your base image, mounting your source tree
+shocker run -v /my/repo:/repo -it img-base sh
+
+# 2. inside: install deps, copy files, configure
+apk add python3
+mkdir -p /app && cp -r /repo/src /app
+exit
+
+# 3. find the stopped container and promote it to a named image
+shocker ps
+shocker commit ps-XXXXX img-myapp
+
+# 4. verify
+shocker run --rm img-myapp python3 /app/main.py
 ```
+
+`shocker init <dir>` is useful for the "from scratch" case — when you've manually assembled a minimal chroot directory (e.g. via `ldd` + copy, as in the tutorial below) and want to import it as an image.
+
+
+## proxy / private registry
+Use `SHOCKER_REGISTRY` to point at a pull-through mirror (e.g. Nexus) or a private registry:
+```sh
+# pull-through mirror (anonymous)
+SHOCKER_REGISTRY=nexus.example.com:8080 shocker pull alpine
+
+# private registry with Bearer auth (e.g. registry.example.com)
+SHOCKER_REGISTRY=registry.example.com \
+  SHOCKER_REGISTRY_USER=myuser \
+  SHOCKER_REGISTRY_PASS=mytoken \
+  shocker pull myorg/myimage:tag
+```
+When the registry responds with a `Www-Authenticate: Bearer` challenge, shocker automatically
+fetches a JWT from the `realm` URL using the supplied credentials.
+
 
 ## Functionality: Not Yet Implemented
 
@@ -219,6 +253,28 @@ We limit each container by default to:
 - 1024 cpu shares
   - you can change this by setting env var `SHOCKER_CPU_SHARE`
   - it's a soft limit - only kicks in when processes are competing for CPU
+
+
+## More crazy?  shocker-in-shocker
+Essentially you can share mount the `/var/shocker` dir and `btrfs` volume
+(kind of like sharing `/var/lib/containers` with `podman`).
+
+Here's an example, adjust accordingly:
+```sh
+# assumes you cloned repo to $HOME/shocker
+shocker pull debian:trixie
+shocker run -v $HOME/shocker:/app -v /var/shocker --rm -it debian:trixie sh
+  # NOTE: for `apt update` or similar you might find your `/tmp` needs sticky bit set, eg:
+  chmod 1777 /tmp
+  apt-get update  -yqq
+  apt-get install -yqq btrfs-progs curl python3 iproute2 iptables util-linux coreutils
+
+  /app/shocker pull alpine
+  /app/shocker run --rm -it alpine sh -c 'cat /etc/issue'
+  # Welcome to Alpine Linux 3.23
+  #Kernel \r on \m (\l)
+  exit
+```
 
 
 ## Understanding containers from scratch
@@ -283,7 +339,7 @@ this will have file/dir isolation, but *not* process isolation (eg: `ps aux` sho
 
 ```sh
 # pick some shocker image you have pulled and update this line:
-IMG=/var/shocker/img_0a690
+IMG=/var/shocker/img-0a690
 mount -t proc proc $IMG/proc
 chroot $IMG /bin/sh
 # play around ^, exit, then cleanup:
