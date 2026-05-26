@@ -87,8 +87,8 @@ Created: img-aa090
 
 > shocker run --rm -it img-aa090
 / # ls
-bin         etc         img.source   media       opt         ps-19998.cmd  ps-ab245.cmd  run           srv         tmp         var
-dev         home        lib          mnt         proc        ps-19998.log  root          sbin          sys         usr
+bin   etc   img.source   media   opt    ps-19998.cmd  ps-ab245.cmd  run     srv   tmp   var
+dev   home  lib          mnt     proc   ps-19998.log  root          sbin    sys   usr
 / # date
 Fri May 22 23:54:38 UTC 2026
 / # exit

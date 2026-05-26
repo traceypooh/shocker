@@ -238,7 +238,7 @@ for l in data.get('layers', []):
       fi
     else
       curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest"
-    fi | tar xf - -C "$btrfs_path/$uuid"
+    fi | tar xzf - -C "$btrfs_path/$uuid"
   done <<< "$layers"
 
   echo "$display" > "$btrfs_path/$uuid/img.source"
