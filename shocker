@@ -19,10 +19,11 @@ cgroups_v1='cpu,cpuacct,memory'
   shift
 done
 
-# Detect cgroup version
+# Detect cgroup version (0 = unavailable, e.g. nested container without /sys mounted)
+CGROUP_VERSION=0
 if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
   CGROUP_VERSION=2
-else
+elif command -v cgcreate &>/dev/null; then
   CGROUP_VERSION=1
 fi
 
@@ -50,7 +51,7 @@ function _cg_create() { # <id>
   if [[ $CGROUP_VERSION -eq 2 ]]; then
     mkdir -p /sys/fs/cgroup/"$id"
     echo "+cpu +memory" >> /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
-  else
+  elif [[ $CGROUP_VERSION -eq 1 ]]; then
     cgcreate -g "$cgroups_v1:/$id"
   fi
 }
@@ -65,7 +66,7 @@ function _cg_set() { # <id>
     [[ $weight -lt 1 ]] && weight=1
     echo "$weight"                          > /sys/fs/cgroup/"$id"/cpu.weight
     echo "$((SHOCKER_MEM_LIMIT * 1048576))" > /sys/fs/cgroup/"$id"/memory.max
-  else
+  elif [[ $CGROUP_VERSION -eq 1 ]]; then
     cgset -r cpu.shares="$SHOCKER_CPU_SHARE"                          "$id"
     cgset -r memory.limit_in_bytes="$((SHOCKER_MEM_LIMIT * 1048576))" "$id"
   fi
@@ -78,8 +79,10 @@ function _cg_exec() { # <id> <cmd…>
     # $1=cgroup.procs path, ${@:2}=actual command — exec preserves all quoting
     local cgroot=/sys/fs/cgroup/"$id"
     bash -c 'echo $$ > "$1" && exec "${@:2}"' -- "${cgroot}/cgroup.procs" "$@"
-  else
+  elif [[ $CGROUP_VERSION -eq 1 ]]; then
     cgexec -g "$cgroups_v1:$id" "$@"
+  else
+    exec "$@"
   fi
 }
 
@@ -87,7 +90,7 @@ function _cg_delete() { # <id>
   local id=$1
   if [[ $CGROUP_VERSION -eq 2 ]]; then
     rmdir /sys/fs/cgroup/"$id" 2>/dev/null || true
-  else
+  elif [[ $CGROUP_VERSION -eq 1 ]]; then
     cgdelete -g "$cgroups_v1:/$id" 2>/dev/null || true
   fi
 }
@@ -249,13 +252,15 @@ function shocker_ps() { #HELP List containers:\nSHOCKER ps
   done
 }
 
-function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <image_id> [command]
+function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v src[:dst]] <image_id> [command]
   # Parse flags
   local interactive=0 do_rm=0
+  local -a volumes=()
   while [[ "${1:-}" == -* ]]; do
     case "$1" in
       -i|-t|-it|-ti) interactive=1 ;;
       --rm) do_rm=1 ;;
+      -v) volumes+=("$2"); shift ;;
       *) echo "Unknown flag: $1" && exit 1 ;;
     esac
     shift
@@ -283,11 +288,12 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <im
     echo "UUID conflict, retrying…"
   done
 
-  [[ "$(shocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
+  local img="$1"
+  [[ "$(shocker_check "$img")" == 1 ]] && echo "No image named '$img' exists" && exit 1
 
-  local cmd="${*:2}"
-  [[ -z "$cmd" && $interactive -eq 1 ]] && cmd='/bin/sh'
-  [[ -z "$cmd" ]] && echo "No command specified" && exit 1
+  local -a cmd_args=("${@:2}") # this is command plus all args
+  [[ ${#cmd_args[@]} -eq 0 && $interactive -eq 1 ]] && cmd_args=('/bin/sh')
+  [[ ${#cmd_args[@]} -eq 0 ]] && echo "No command specified" && exit 1
   # Derive IP from full 5-hex-digit UUID value (1–253) to minimize collision
   local hex="${uuid#ps_}"
   local suffix; suffix=$(( 16#${hex} % 253 + 1 ))
@@ -301,41 +307,32 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <im
   ip link set veth0_"$uuid" master bridge0
   ip netns add netns_"$uuid"
   ip link set veth1_"$uuid" netns netns_"$uuid"
-  ip netns exec netns_"$uuid" ip link set dev lo up
-  ip netns exec netns_"$uuid" ip link set veth1_"$uuid" address "$mac"
-  ip netns exec netns_"$uuid" ip addr add "$ip/24" dev veth1_"$uuid"
-  ip netns exec netns_"$uuid" ip link set dev veth1_"$uuid" up
-  ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
+  nsenter --net=/run/netns/netns_"$uuid" ip link set dev lo up
+  nsenter --net=/run/netns/netns_"$uuid" ip link set veth1_"$uuid" address "$mac"
+  nsenter --net=/run/netns/netns_"$uuid" ip addr add "$ip/24" dev veth1_"$uuid"
+  nsenter --net=/run/netns/netns_"$uuid" ip link set dev veth1_"$uuid" up
+  nsenter --net=/run/netns/netns_"$uuid" ip route add default via 10.0.0.1
 
   local root="$btrfs_path/$uuid"
 
-  btrfs subvolume snapshot "$btrfs_path/$1" "$root" > /dev/null
+  btrfs subvolume snapshot "$btrfs_path/$img" "$root" > /dev/null
   mkdir -p "$root/etc"
 
   # use host DNS resolving
   cp /etc/resolv.conf "$root/etc/resolv.conf"
 
-  echo "$cmd" > "$root/$uuid.cmd"
+  echo "${cmd_args[*]}" > "$root/$uuid.cmd"
 
   _cg_create "$uuid"
   _cg_set    "$uuid"
 
+  local -a all_vols=("${volumes[@]}")
   if [[ $interactive -eq 1 ]]; then
-    mkdir -p "$root/dev/pts"
-    touch "$root/dev/tty"
-    # Inside the new mount namespace: bind /dev/pts + /dev/tty so the PTY works, then chroot.
-    # $1=root $2=cmd avoids quoting issues across the exec boundary.
-    _cg_exec "$uuid" \
-      ip netns exec netns_"$uuid" \
-      unshare -fmuip --mount-proc="$root/proc" \
-      /bin/sh -c 'mount --bind /dev/pts "$1/dev/pts" 2>/dev/null && mount --bind /dev/tty "$1/dev/tty" 2>/dev/null && exec chroot "$1" /bin/sh -c "$2"' \
-      -- "$root" "$cmd" || true
+    mkdir -p "$root/dev/pts" && touch "$root/dev/tty"
+    all_vols=('/dev/pts' '/dev/tty' "${all_vols[@]}")
+    _run_ns "$uuid" "$root" "${#all_vols[@]}" "${all_vols[@]}" "${cmd_args[@]}" || true
   else
-    _cg_exec "$uuid" \
-      ip netns exec netns_"$uuid" \
-      unshare -fmuip --mount-proc="$root/proc" \
-      chroot "$root" \
-      /bin/sh -c "$cmd" \
+    _run_ns "$uuid" "$root" "${#all_vols[@]}" "${all_vols[@]}" "${cmd_args[@]}" \
       2>&1 | tee "$root/$uuid.log" || true
   fi
 
@@ -343,6 +340,25 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] <im
   ip netns del netns_"$uuid"
 
   [[ $do_rm -eq 1 ]] && shocker_rm "$uuid" > /dev/null
+}
+function _run_ns() { # <uuid> <root> <nvols> [vol…] <cmd…>
+  # root+nvols passed as env vars; positional args are purely: vol… cmd…
+  local uuid=$1 nsroot=$2 nvols=$3; shift 3
+  nsroot="$nsroot" nvols="$nvols" \
+  _cg_exec "$uuid" \
+    nsenter --net=/run/netns/netns_"$uuid" \
+      unshare -fmuip --propagation unchanged \
+        /bin/sh -c '
+          mount -n -t proc proc "$nsroot/proc" 2>/dev/null
+          i=0; while [ "$i" -lt "$nvols" ]; do
+            volarg=$1; shift; i=$((i+1))
+            src="${volarg%%:*}" dst="${volarg#*:}"
+            if [ -d "$src" ]; then mkdir -p "$nsroot$dst"
+            else mkdir -p "$(dirname "$nsroot$dst")" && touch "$nsroot$dst"; fi
+            mount --bind "$src" "$nsroot$dst" 2>/dev/null
+          done
+          exec chroot "$nsroot" "$@"
+        ' -- "$@"
 }
 
 function shocker_exec() { #HELP Execute a command in a running container:\nSHOCKER exec <container_id> <command>
