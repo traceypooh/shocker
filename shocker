@@ -103,7 +103,8 @@ function shocker_init() { #HELP Create an image from a directory:\nSHOCKER init 
     [[ "$(shocker_check "$uuid")" == 0 ]] && shocker_run "$@"
     btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
     cp -rf --reflink=auto "$1"/* "$btrfs_path/$uuid" > /dev/null
-    [[ ! -f "$btrfs_path/$uuid/img.source" ]] && echo "$1" > "$btrfs_path/$uuid/img.source"
+    mkdir -p "$btrfs_path/$uuid/shocker"
+    [[ ! -f "$btrfs_path/$uuid/shocker/source" ]] && echo "$1" > "$btrfs_path/$uuid/shocker/source"
     echo "Created: $uuid"
   else
     echo "No directory named '$1' exists" && exit 1
@@ -222,6 +223,7 @@ for l in data.get('layers', []):
   # Create btrfs subvolume up front; pipe each layer blob directly into tar — zero /tmp usage.
   local uuid="img-$(_uuid)"
   btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
+  mkdir -p "$btrfs_path/$uuid/shocker"
 
   while IFS= read -r digest; do
     echo "Pulling layer ${digest:7:19}…"
@@ -241,7 +243,26 @@ for l in data.get('layers', []):
     fi | tar xzf - -C "$btrfs_path/$uuid"
   done <<< "$layers"
 
-  echo "$display" > "$btrfs_path/$uuid/img.source"
+  # Persist ENTRYPOINT+CMD+WORKDIR from the image config blob
+  local config_digest
+  config_digest="$(echo "$manifest" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('config',{}).get('digest',''))" 2>/dev/null || true)"
+  if [[ -n "$config_digest" ]]; then
+    curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$config_digest" 2>/dev/null \
+      | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+cfg = data.get('config', {})
+base = sys.argv[1]
+ep = cfg.get('Entrypoint') or []
+cm = cfg.get('Cmd') or []
+json.dump(ep + cm, open(base + '/shocker/entrypoint', 'w'))
+wd = cfg.get('WorkingDir') or data.get('WorkingDir') or ''
+open(base + '/shocker/workdir', 'w').write(wd)
+" "$btrfs_path/$uuid" 2>/dev/null || true
+  fi
+
+  echo "$display" > "$btrfs_path/$uuid/shocker/source"
   echo "Created: $uuid"
 }
 
@@ -256,7 +277,7 @@ function shocker_images() { #HELP List images:\nSHOCKER images
   echo -e "IMAGE_ID\t\tSOURCE"
   for img in "$btrfs_path"/img-*; do
     img=$(basename "$img")
-    echo -e "$img\t\t$(cat "$btrfs_path/$img/img.source")"
+    echo -e "$img\t\t$(cat "$btrfs_path/$img/shocker/source")"
   done
 }
 
@@ -268,15 +289,16 @@ function shocker_ps() { #HELP List containers:\nSHOCKER ps
   done
 }
 
-function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v src[:dst]] <image_id> [command]
+function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v src[:dst]] [-e VAR=val] <image_id> [command]
   # Parse flags
   local interactive=0 do_rm=0
-  local -a volumes=()
+  local -a volumes=() env_vars=()
   while [[ "${1:-}" == -* ]]; do
     case "$1" in
       -i|-t|-it|-ti) interactive=1 ;;
       --rm) do_rm=1 ;;
       -v) volumes+=("$2"); shift ;;
+      -e) env_vars+=("$2"); shift ;;
       *) echo "Unknown flag: $1" && exit 1 ;;
     esac
     shift
@@ -308,15 +330,25 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v
   # Allow "alpine" or "alpine:latest" — look up img-XXXXX by img.source content
   if [[ "$img" != img-* && "$img" != ps-* ]]; then
     local search="$img"; [[ "$img" != *:* ]] && search="$img:latest"
-    img=$(grep -rlx "$search" "$btrfs_path"/img-*/img.source 2>/dev/null \
-          | head -1 | xargs -r dirname | xargs -r basename) || true
+    img=$(grep -rlx "$search" "$btrfs_path"/img-*/shocker/source 2>/dev/null \
+          | head -1 | sed 's|.*/\(img-[^/]*\)/.*|\1|') || true
     [[ -z "$img" ]] && echo "No image named '$1' exists" && exit 1
   fi
   [[ "$(shocker_check "$img")" == 1 ]] && echo "No image named '$img' exists" && exit 1
 
   local -a cmd_args=("${@:2}") # this is command plus all args
   [[ ${#cmd_args[@]} -eq 0 && $interactive -eq 1 ]] && cmd_args=('/bin/sh')
-  [[ ${#cmd_args[@]} -eq 0 ]] && echo "No command specified" && exit 1
+  if [[ ${#cmd_args[@]} -eq 0 ]]; then
+    local ep_file="$btrfs_path/$img/shocker/entrypoint"
+    [[ -f "$ep_file" ]] && mapfile -t cmd_args < <(python3 -c \
+      "import json,sys; [print(a) for a in json.load(open(sys.argv[1]))]" "$ep_file") 2>/dev/null || true
+    [[ ${#cmd_args[@]} -eq 0 ]] && echo "No command specified (and image has no ENTRYPOINT/CMD)" && exit 1
+  fi
+  local workdir='/'
+  local wd_file="$btrfs_path/$img/shocker/workdir"
+  [[ -f "$wd_file" ]] && workdir="$(cat "$wd_file")"
+  [[ -z "$workdir" ]] && workdir='/'
+  [[ ${#env_vars[@]} -gt 0 ]] && cmd_args=("env" "${env_vars[@]}" "${cmd_args[@]}")
   # Derive IP from full 5-hex-digit UUID value (1–253) to minimize collision
   local hex="${uuid#ps-}"
   local suffix; suffix=$(( 16#${hex} % 253 + 1 ))
@@ -351,11 +383,9 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v
 
   local -a all_vols=("${volumes[@]}")
   if [[ $interactive -eq 1 ]]; then
-    mkdir -p "$root/dev/pts" && touch "$root/dev/tty"
-    all_vols=('/dev/pts' '/dev/tty' "${all_vols[@]}")
-    _run_ns "$uuid" "$root" "${#all_vols[@]}" "${all_vols[@]}" "${cmd_args[@]}" || true
+    _run_ns "$uuid" "$root" "${#all_vols[@]}" "$workdir" "${all_vols[@]}" "${cmd_args[@]}" || true
   else
-    _run_ns "$uuid" "$root" "${#all_vols[@]}" "${all_vols[@]}" "${cmd_args[@]}" \
+    _run_ns "$uuid" "$root" "${#all_vols[@]}" "$workdir" "${all_vols[@]}" "${cmd_args[@]}" \
       2>&1 | tee "$root/$uuid.log" || true
   fi
 
@@ -364,14 +394,14 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v
 
   [[ $do_rm -eq 1 ]] && shocker_rm "$uuid" > /dev/null
 }
-function _run_ns() { # <uuid> <root> <nvols> [vol…] <cmd…>
-  # root+nvols passed as env vars; positional args are purely: vol… cmd…
-  local uuid=$1 nsroot=$2 nvols=$3; shift 3
-  nsroot="$nsroot" nvols="$nvols" \
+function _run_ns() { # <uuid> <root> <nvols> <workdir> [vol…] <cmd…>
+  local uuid=$1 nsroot=$2 nvols=$3 workdir=$4; shift 4
+  nsroot="$nsroot" nvols="$nvols" workdir="$workdir" \
   _cg_exec "$uuid" \
     nsenter --net=/run/netns/netns_"$uuid" \
       unshare -fmuip --propagation unchanged \
         /bin/sh -c '
+          mount -t devtmpfs devtmpfs "$nsroot/dev" 2>/dev/null
           mount -n -t proc proc "$nsroot/proc" 2>/dev/null
           i=0; while [ "$i" -lt "$nvols" ]; do
             volarg=$1; shift; i=$((i+1))
@@ -380,7 +410,7 @@ function _run_ns() { # <uuid> <root> <nvols> [vol…] <cmd…>
             else mkdir -p "$(dirname "$nsroot$dst")" && touch "$nsroot$dst"; fi
             mount --bind "$src" "$nsroot$dst" 2>/dev/null
           done
-          exec chroot "$nsroot" "$@"
+          exec chroot "$nsroot" /bin/sh -c "cd \"$workdir\" && exec \"\$@\"" -- "$@"
         ' -- "$@"
 }
 

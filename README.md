@@ -1,13 +1,26 @@
 # shocker
 Docker implemented in around 300 lines of bash ⚡️
 
-Fork of bocker (github.com/p8952/bocker). updated for 2026.
+Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
 
   * [Prerequisites](#prerequisites)
   * [Example Usage](#example-usage)
   * [Functionality: Currently Implemented](#functionality-currently-implemented)
+  * [2026 Modernization](#2026-modernization)
+    * [What broke in bocker and what shocker fixes](#what-broke-in-bocker-and-what-shocker-fixes)
+    * [Second pass of fixes/improvements](#second-pass-of-fixesimprovements)
+    * [Third pass of fixes](#third-pass-of-fixes)
+    * [Fourth pass of fixes/improvements](#fourth-pass-of-fixesimprovements)
+    * [Fifth pass of fixes/improvements](#fifth-pass-of-fixesimprovements)
+  * [btrfs /var/shocker setup](#btrfs-varshocker-setup)
+  * [Building images](#building-images)
+  * [proxy / private registry](#proxy--private-registry)
   * [Functionality: Not Yet Implemented](#functionality-not-yet-implemented)
   * [License](#license)
+  * [Control Groups (cgroups)](#control-groups-cgroups)
+  * [More crazy? shocker-in-shocker](#more-crazy--shocker-in-shocker)
+  * [Understanding containers from scratch](#understanding-containers-from-scratch)
+
 
 ## Prerequisites
 
@@ -31,6 +44,7 @@ Additionally your system will need or gets configured with the following:
 You probably still want to **run shocker in a virtual machine**. `shocker` runs as `root` and among other things, makes changes to your network interfaces, routing table, and firewall rules.
 
 **We can make no guarantees that it won't trash your system**.
+
 
 ## Example Usage
 
@@ -93,6 +107,7 @@ dev   home  lib          mnt     proc   ps-19998.log  root          sbin    sys 
 Fri May 22 23:54:38 UTC 2026
 / # exit
 ```
+
 
 ## Functionality: Currently Implemented
 
