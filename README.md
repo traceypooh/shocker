@@ -33,6 +33,7 @@ The following packages are needed to run shocker.
 * iptables
 * util-linux
 * coreutils
+* bash
 
 Additionally your system will need or gets configured with the following:
 
@@ -282,7 +283,7 @@ shocker run -v $HOME/shocker:/app -v /var/shocker --rm -it debian:trixie sh
   # NOTE: for `apt update` or similar you might find your `/tmp` needs sticky bit set, eg:
   chmod 1777 /tmp
   apt-get update  -yqq
-  apt-get install -yqq btrfs-progs curl python3 iproute2 iptables util-linux coreutils
+  apt-get install -yqq btrfs-progs curl python3 iproute2 iptables util-linux coreutils bash
 
   /app/shocker pull alpine
   /app/shocker run --rm -it alpine sh -c 'cat /etc/issue'
