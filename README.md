@@ -214,6 +214,8 @@ shocker commit ps-XXXXX img-myapp
 shocker run --rm img-myapp python3 /app/main.py
 ```
 
+You can see a list of shell calls for `shocker run` at: [example-run.md](example-run.md)
+
 `shocker init <dir>` is useful for the "from scratch" case — when you've manually assembled a minimal chroot directory (e.g. via `ldd` + copy, as in the tutorial below) and want to import it as an image.
 
 
@@ -360,4 +362,18 @@ mount -t proc proc $IMG/proc
 chroot $IMG /bin/sh
 # play around ^, exit, then cleanup:
 umount $IMG/proc
+```
+
+### direct chroot with unshare
+this has process isolation and more, adding on `unshare`
+```
+-f --fork   dont hold namespace open after your shell exits
+-m --mount  make all mounts inside private to your namespace; when exits, auto unmounts & tears down
+-p --pid    give chroot own PID namespace; starts w/ pid 1 and cant see host pids
+```
+
+```sh
+unshare  -fump  chroot  /var/shocker/img-85e96  /bin/sh
+# optional, for top, ps faux inside, you can do:
+# mount -t proc proc /proc
 ```
