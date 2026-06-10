@@ -259,6 +259,8 @@ cm = cfg.get('Cmd') or []
 json.dump(ep + cm, open(base + '/shocker/entrypoint', 'w'))
 wd = cfg.get('WorkingDir') or data.get('WorkingDir') or ''
 open(base + '/shocker/workdir', 'w').write(wd)
+env = cfg.get('Env') or []
+open(base + '/shocker/env', 'w').write('\n'.join(env) + ('\n' if env else ''))
 " "$btrfs_path/$uuid" 2>/dev/null || true
   fi
 
@@ -348,7 +350,10 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v
   local wd_file="$btrfs_path/$img/shocker/workdir"
   [[ -f "$wd_file" ]] && workdir="$(cat "$wd_file")"
   [[ -z "$workdir" ]] && workdir='/'
-  [[ ${#env_vars[@]} -gt 0 ]] && cmd_args=("env" "${env_vars[@]}" "${cmd_args[@]}")
+  local -a img_env=()
+  local env_file="$btrfs_path/$img/shocker/env"
+  [[ -f "$env_file" ]] && mapfile -t img_env < "$env_file"
+  cmd_args=("env" "-i" "${img_env[@]}" "${env_vars[@]}" "${cmd_args[@]}")
   # Derive IP from full 5-hex-digit UUID value (1–253) to minimize collision
   local hex="${uuid#ps-}"
   local suffix; suffix=$(( 16#${hex} % 253 + 1 ))
