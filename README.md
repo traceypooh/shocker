@@ -20,6 +20,7 @@ Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
   * [Control Groups (cgroups)](#control-groups-cgroups)
   * [More crazy? shocker-in-shocker](#more-crazy--shocker-in-shocker)
   * [Understanding containers from scratch](#understanding-containers-from-scratch)
+  * [Using shocker on a mac](#using-shocker-on-a-mac)
 
 
 ## Prerequisites
@@ -377,3 +378,37 @@ unshare  -fump  chroot  /var/shocker/img-85e96  /bin/sh
 # optional, for top, ps faux inside, you can do:
 # mount -t proc proc /proc
 ```
+
+## Using shocker on a mac
+
+macOS doesn't have the Linux kernel features shocker needs, but you can run it inside a [Podman](https://podman.io) VM (which is a real Linux VM, not a container):
+
+```sh
+# one-time setup
+brew install podman
+podman machine init
+podman machine start
+
+# ssh into the VM and become root
+podman machine ssh
+sudo su -
+
+# install shocker dependencies (Fedora CoreOS uses dnf)
+dnf install -y btrfs-progs curl python3 iptables util-linux coreutils bash
+
+# download shocker
+curl https://raw.githubusercontent.com/traceypooh/shocker/refs/heads/master/shocker > shocker
+chmod +x shocker
+
+# set up btrfs image file and mount it (see linux setup above)
+truncate -s 10G /var/shocker.img
+mkfs.btrfs /var/shocker.img
+mkdir -p /var/shocker
+mount -o loop /var/shocker.img /var/shocker
+
+# pull and run
+./shocker pull alpine
+./shocker run --rm -it alpine
+```
+
+The podman VM persists between `podman machine stop` / `podman machine start` but the btrfs mount does not survive reboots — re-run the `mount` line after restarting.
