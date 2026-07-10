@@ -264,6 +264,9 @@ open(base + '/shocker/env', 'w').write('\n'.join(env) + ('\n' if env else ''))
 " "$btrfs_path/$uuid" 2>/dev/null || true
   fi
 
+  grep -lx "$display" "$btrfs_path"/img-*/shocker/source 2>/dev/null \
+    | grep -v "/$uuid/shocker/source" \
+    | xargs -r -I{} sh -c 'echo _none_ > "{}"'
   echo "$display" > "$btrfs_path/$uuid/shocker/source"
   echo "Created: $uuid"
 }
