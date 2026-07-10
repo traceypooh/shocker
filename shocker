@@ -35,15 +35,52 @@ function _uuid() {
 }
 
 function btrfs_check() {
-  # Ensure the btrfs root exists (user must have a btrfs filesystem mounted here)
+  if [[ "${SHOCKER_OVERLAY:-0}" == "1" ]]; then
+    mkdir -p "$btrfs_path"
+    return
+  fi
   if [[ ! -d "$btrfs_path" ]]; then
-    echo "mount a btrfs filesystem at $btrfs_path first - see REAMDE.md for suggestion"
+    echo "mount a btrfs filesystem at $btrfs_path first - see README.md for suggestion"
     exit 1
   fi
 }
 
 function shocker_check() {
-  btrfs subvolume list "$btrfs_path" | grep -qw "$1" && echo 0 || echo 1
+  if [[ "${SHOCKER_OVERLAY:-0}" == "1" ]]; then
+    [[ -d "$btrfs_path/$1" ]] && echo 0 || echo 1
+  else
+    btrfs subvolume list "$btrfs_path" | grep -qw "$1" && echo 0 || echo 1
+  fi
+}
+
+function _subvol_create() { # <path>
+  if [[ "${SHOCKER_OVERLAY:-0}" == "1" ]]; then
+    mkdir -p "$1"
+  else
+    btrfs subvolume create "$1" > /dev/null
+  fi
+}
+
+function _subvol_snapshot() { # <src> <dst>
+  if [[ "${SHOCKER_OVERLAY:-0}" == "1" ]]; then
+    local name; name="$(basename "$2")"
+    mkdir -p "$btrfs_path/.overlay/$name/upper" "$btrfs_path/.overlay/$name/work" "$2"
+    mount -t overlay overlay \
+      -o "lowerdir=$1,upperdir=$btrfs_path/.overlay/$name/upper,workdir=$btrfs_path/.overlay/$name/work" \
+      "$2"
+  else
+    btrfs subvolume snapshot "$1" "$2" > /dev/null
+  fi
+}
+
+function _subvol_delete() { # <path>
+  if [[ "${SHOCKER_OVERLAY:-0}" == "1" ]]; then
+    local name; name="$(basename "$1")"
+    umount "$1" 2>/dev/null || true
+    rm -rf "$btrfs_path/.overlay/$name" "$1"
+  else
+    btrfs subvolume delete "$1" > /dev/null
+  fi
 }
 
 function _cg_create() { # <id>
@@ -101,7 +138,7 @@ function shocker_init() { #HELP Create an image from a directory:\nSHOCKER init 
   local uuid="img-$(_uuid)"
   if [[ -d "$1" ]]; then
     [[ "$(shocker_check "$uuid")" == 0 ]] && shocker_run "$@"
-    btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
+    _subvol_create "$btrfs_path/$uuid"
     cp -rf --reflink=auto "$1"/* "$btrfs_path/$uuid" > /dev/null
     mkdir -p "$btrfs_path/$uuid/shocker"
     [[ ! -f "$btrfs_path/$uuid/shocker/source" ]] && echo "$1" > "$btrfs_path/$uuid/shocker/source"
@@ -222,7 +259,7 @@ for l in data.get('layers', []):
 
   # Create btrfs subvolume up front; pipe each layer blob directly into tar — zero /tmp usage.
   local uuid="img-$(_uuid)"
-  btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
+  _subvol_create "$btrfs_path/$uuid"
   mkdir -p "$btrfs_path/$uuid/shocker"
 
   while IFS= read -r digest; do
@@ -275,7 +312,7 @@ open(base + '/shocker/env', 'w').write('\n'.join(env) + ('\n' if env else ''))
 
 function shocker_rm() { #HELP Delete an image or container:\nSHOCKER rm <image_id or container_id>
   [[ "$(shocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
-  btrfs subvolume delete "$btrfs_path/$1" > /dev/null
+  _subvol_delete "$btrfs_path/$1"
   _cg_delete "$1"
   echo "Removed: $1"
 }
@@ -380,7 +417,7 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [-v
 
   local root="$btrfs_path/$uuid"
 
-  btrfs subvolume snapshot "$btrfs_path/$img" "$root" > /dev/null
+  _subvol_snapshot "$btrfs_path/$img" "$root"
   mkdir -p "$root/etc"
 
   # use host DNS resolving
@@ -443,7 +480,13 @@ function shocker_logs() { #HELP View logs from a container:\nSHOCKER logs <conta
 function shocker_commit() { #HELP Commit a container to an image:\nSHOCKER commit <container_id> <image_id>
   [[ "$(shocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
   [[ "$(shocker_check "$2")" == 1 ]] && echo "No image named '$2' exists" && exit 1
-  shocker_rm "$2" && btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$2" > /dev/null
+  if [[ "${SHOCKER_OVERLAY:-0}" == "1" ]]; then
+    shocker_rm "$2"
+    _subvol_create "$btrfs_path/$2"
+    cp -a "$btrfs_path/$1/." "$btrfs_path/$2/"
+  else
+    shocker_rm "$2" && btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$2" > /dev/null
+  fi
   echo "Created: $2"
 }
 
