@@ -35,6 +35,8 @@ function _uuid() {
 }
 
 function btrfs_check() {
+  # SHOCKER_DEST bypasses btrfs entirely — pull unpacks straight into a plain directory
+  [[ -n "${SHOCKER_DEST:-}" ]] && return
   # Ensure the btrfs root exists (user must have a btrfs filesystem mounted here)
   if [[ ! -d "$btrfs_path" ]]; then
     echo "mount a btrfs filesystem at $btrfs_path first - see REAMDE.md for suggestion"
@@ -221,9 +223,21 @@ for l in data.get('layers', []):
   [[ -z "$layers" ]] && echo "No image '$name:$tag' found or unsupported manifest" && exit 1
 
   # Create btrfs subvolume up front; pipe each layer blob directly into tar — zero /tmp usage.
-  local uuid="img-$(_uuid)"
-  btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
-  mkdir -p "$btrfs_path/$uuid/shocker"
+  # SHOCKER_DEST bypasses btrfs and unpacks straight into a plain directory instead.
+  local uuid dest
+  if [[ -n "${SHOCKER_DEST:-}" ]]; then
+    dest="$SHOCKER_DEST"
+    # Re-pulling the same dest should reflect the image as-is, not accumulate stale
+    # files from a previous pull whose layers no longer include them.
+    [[ -e "$dest" ]] && read -rp "[RETURN] to replace existing '$dest' (Ctrl-C to abort)... "
+    rm -rf "$dest"
+    mkdir -p "$dest"
+  else
+    uuid="img-$(_uuid)"
+    dest="$btrfs_path/$uuid"
+    btrfs subvolume create "$dest" > /dev/null
+  fi
+  mkdir -p "$dest/shocker"
 
   while IFS= read -r digest; do
     echo "Pulling layer ${digest:7:19}…"
@@ -240,7 +254,7 @@ for l in data.get('layers', []):
       fi
     else
       curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest"
-    fi | tar xzf - -C "$btrfs_path/$uuid"
+    fi | tar xzf - -C "$dest"
   done <<< "$layers"
 
   # Persist ENTRYPOINT+CMD+WORKDIR from the image config blob
@@ -261,16 +275,18 @@ wd = cfg.get('WorkingDir') or data.get('WorkingDir') or ''
 open(base + '/shocker/workdir', 'w').write(wd)
 env = cfg.get('Env') or []
 open(base + '/shocker/env', 'w').write('\n'.join(env) + ('\n' if env else ''))
-" "$btrfs_path/$uuid" 2>/dev/null || true
+" "$dest" 2>/dev/null || true
   fi
 
-  local -a _src_files=("$btrfs_path"/img-*/shocker/source)
-  [[ ${#_src_files[@]} -gt 0 ]] && \
-    grep -lx "$display" "${_src_files[@]}" 2>/dev/null \
-      | grep -v "/$uuid/shocker/source" \
-      | xargs -r -I{} sh -c 'echo _none_ > "{}"'
-  echo "$display" > "$btrfs_path/$uuid/shocker/source"
-  echo "Created: $uuid"
+  if [[ -z "${SHOCKER_DEST:-}" ]]; then
+    local -a _src_files=("$btrfs_path"/img-*/shocker/source)
+    [[ ${#_src_files[@]} -gt 0 ]] && \
+      grep -lx "$display" "${_src_files[@]}" 2>/dev/null \
+        | grep -v "/$uuid/shocker/source" \
+        | xargs -r -I{} sh -c 'echo _none_ > "{}"'
+  fi
+  echo "$display" > "$dest/shocker/source"
+  echo "Created: ${uuid:-$dest}"
 }
 
 function shocker_rm() { #HELP Delete an image or container:\nSHOCKER rm <image_id or container_id>

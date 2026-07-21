@@ -21,6 +21,7 @@ Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
   * [More crazy? shocker-in-shocker](#more-crazy--shocker-in-shocker)
   * [Understanding containers from scratch](#understanding-containers-from-scratch)
   * [Using shocker on a mac](#using-shocker-on-a-mac)
+  * [pull-only: no btrfs/overlay required](#pull-only-no-btrfsoverlay-required)
 
 
 ## Prerequisites
@@ -412,3 +413,30 @@ mount -o loop /var/shocker.img /var/shocker
 ```
 
 The podman VM persists between `podman machine stop` / `podman machine start` but the btrfs mount does not survive reboots — re-run the `mount` line after restarting.
+
+
+## pull-only: no btrfs/overlay required
+
+If you just need a Docker image unpacked into a plain directory — no `/var/shocker`, no btrfs, no overlay, no host setup at all — there's a standalone [`pull`](pull) script for that:
+
+```sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/traceypooh/shocker/HEAD/pull)" - alpine mydir
+```
+
+(the `-` arg is a placeholder so `alpine`/`mydir` land in `$1`/`$2`)
+
+This unpacks `alpine` into `./mydir`. Re-running it against the same dest dir wipes and re-extracts cleanly, after a `[RETURN] to replace ...` confirmation (Ctrl-C to abort).
+
+Under the hood this just sets `SHOCKER_DEST` and delegates to `shocker pull`, so if you already have `shocker` on hand you can do the same thing directly:
+
+```sh
+SHOCKER_DEST=mydir shocker pull alpine
+# or, using the generic --key=value flag parsing:
+shocker --dest=mydir pull alpine
+```
+
+There's no `shocker run` equivalent in this mode — that needs cgroups/btrfs snapshots/networking — but for quick poking around, `chroot` + `unshare` (may need `sudo`) gets you process isolation too:
+
+```sh
+unshare -fmup chroot mydir /bin/sh
+```

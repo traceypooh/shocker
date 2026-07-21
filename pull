@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# pull — unpack a Docker image into a plain directory, no btrfs/overlay/etc required.
+#
+#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/traceypooh/shocker/HEAD/pull)" pull alpine [DEST DIR]
+#
+# Delegates to shocker_pull() in the main `shocker` script (SHOCKER_DEST mode), so all
+# registry/auth/manifest logic stays in one place. To poke around the result:
+#   unshare -fmup chroot [DEST DIR] /bin/sh
+
+set -o errexit -o nounset -o pipefail
+
+SHOCKER_URL="${SHOCKER_URL:-https://raw.githubusercontent.com/traceypooh/shocker/HEAD/shocker}"
+
+img="${1:?usage: pull <image[:tag]> [dest-dir]}"
+dest="${2:-$(echo "$img" | tr '/:' '__')}"
+
+SHOCKER_DEST="$dest" bash -c "$(curl -fsSL "$SHOCKER_URL")" shocker pull "$img"
+
+echo "Unpacked '$img' into: $dest"
+echo "Try it:  unshare -fmup chroot $dest /bin/sh"
