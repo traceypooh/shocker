@@ -247,8 +247,8 @@ for l in data.get('layers', []):
         "${auth_hdr[@]}" \
         "$registry/$name/blobs/$digest")"
       if [[ -n "$cdn_url" ]]; then
-        curl -fsSL --noproxy '*' "$cdn_url" \
-          || { echo "Layer download failed — CDN unreachable directly. Set SHOCKER_REGISTRY to a pull-through mirror." && exit 1; }
+        curl -fsSL "$cdn_url" \
+          || { echo "Layer download failed. Set SHOCKER_REGISTRY to a pull-through mirror." && exit 1; }
       else
         curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest"
       fi
