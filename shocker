@@ -176,7 +176,7 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   # Fetch manifest — may be a manifest list (multi-arch index) or a single manifest
   local manifest
   manifest="$(curl -fsSL \
-    "${auth_hdr[@]}" \
+    ${auth_hdr[@]+"${auth_hdr[@]}"} \
     -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
     -H 'Accept: application/vnd.oci.image.index.v1+json' \
     -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
@@ -205,7 +205,7 @@ for m in data.get('manifests', []):
 " 2>/dev/null)"
     [[ -z "$target_digest" ]] && echo "No image for arch '$arch' in '$name:$tag'" && exit 1
     manifest="$(curl -fsSL \
-      "${auth_hdr[@]}" \
+      ${auth_hdr[@]+"${auth_hdr[@]}"} \
       -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
       -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
       "$registry/$name/manifests/$target_digest")"
@@ -244,16 +244,16 @@ for l in data.get('layers', []):
     if [[ -z "${SHOCKER_REGISTRY:-}" ]]; then
       local cdn_url
       cdn_url="$(curl -sw '%{redirect_url}' -o /dev/null \
-        "${auth_hdr[@]}" \
+        ${auth_hdr[@]+"${auth_hdr[@]}"} \
         "$registry/$name/blobs/$digest")"
       if [[ -n "$cdn_url" ]]; then
         curl -fsSL "$cdn_url" \
           || { echo "Layer download failed. Set SHOCKER_REGISTRY to a pull-through mirror." && exit 1; }
       else
-        curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest"
+        curl -fsSL ${auth_hdr[@]+"${auth_hdr[@]}"} "$registry/$name/blobs/$digest"
       fi
     else
-      curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$digest"
+      curl -fsSL ${auth_hdr[@]+"${auth_hdr[@]}"} "$registry/$name/blobs/$digest"
     fi | tar xzf - -C "$dest"
   done <<< "$layers"
 
@@ -262,7 +262,7 @@ for l in data.get('layers', []):
   config_digest="$(echo "$manifest" | python3 -c \
     "import sys,json; d=json.load(sys.stdin); print(d.get('config',{}).get('digest',''))" 2>/dev/null || true)"
   if [[ -n "$config_digest" ]]; then
-    curl -fsSL "${auth_hdr[@]}" "$registry/$name/blobs/$config_digest" 2>/dev/null \
+    curl -fsSL ${auth_hdr[@]+"${auth_hdr[@]}"} "$registry/$name/blobs/$config_digest" 2>/dev/null \
       | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
