@@ -452,7 +452,8 @@ shocker run -e FOO=bar ./mydir sh -c 'echo $FOO'
 ```
 
 This "lite" run uses the image's `ENTRYPOINT`/`CMD`, `WORKDIR` and `ENV` like a normal `run`, but:
-- runs **in place** — changes persist in `mydir` (`--rm` is ignored)
+- runs **in place** — changes persist in `mydir` (`--rm` is ignored).
+  For disposable runs without CoW, see the [hardlink farm + repair idea](hardlink-containers.md)
 - uses the **host's network** (copies in host `/etc/resolv.conf`) — no bridge/veth/netns
 - no cgroups (cpu/memory limits)
 - uses `unshare` for mount/pid/uts/ipc namespaces if it works, otherwise plain `chroot`
