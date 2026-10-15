@@ -488,6 +488,7 @@ Notes:
 - inside, `pwd` may show the path from *outside* the chroot (eg: `/root/alp`) and `cd ..` fails — an iSH quirk; you really are at the image's `/`.
 
 
+### iSH app on iPhone example run:
 ```sh
 apk add bash curl jq
 curl -fsSLO https://raw.githubusercontent.com/traceypooh/shocker/HEAD/shocker
@@ -503,3 +504,5 @@ apk add -q figlet
 figlet wtf
 exit
 ```
+
+![shocker on iOS demo screenshot showing pull and run](shocker-ios.jpg)
