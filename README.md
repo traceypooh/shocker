@@ -12,6 +12,7 @@ Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
     * [Third pass of fixes](#third-pass-of-fixes)
     * [Fourth pass of fixes/improvements](#fourth-pass-of-fixesimprovements)
     * [Fifth pass of fixes/improvements](#fifth-pass-of-fixesimprovements)
+    * [Sixth pass of fixes/improvements](#sixth-pass-of-fixesimprovements)
   * [btrfs /var/shocker setup](#btrfs-varshocker-setup)
   * [Building images](#building-images)
   * [proxy / private registry](#proxy--private-registry)
@@ -21,7 +22,8 @@ Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
   * [More crazy? shocker-in-shocker](#more-crazy--shocker-in-shocker)
   * [Understanding containers from scratch](#understanding-containers-from-scratch)
   * [Using shocker on a mac](#using-shocker-on-a-mac)
-  * [pull-only: no btrfs/overlay required](#pull-only-no-btrfsoverlay-required)
+  * [pull & run: no btrfs/overlay required](#pull--run-no-btrfsoverlay-required)
+  * [Using shocker on iOS (iSH)](#using-shocker-on-ios-ish)
 
 
 ## Prerequisites
@@ -30,7 +32,7 @@ The following packages are needed to run shocker.
 
 * btrfs-progs
 * curl
-* python3
+* jq
 * iproute2
 * iptables
 * util-linux
@@ -170,6 +172,13 @@ Fri May 22 23:54:38 UTC 2026
 - add `iptables` network forwarding so networking out inside containers works
 - use host `/etc/resolv.conf` since may have specific DNS resolving setup
 
+### Sixth pass of fixes/improvements
+- `shocker run <directory>` — "lite" run of a plain dir (eg: from `--dest=` pull): no btrfs/netns/cgroups needed (see [below](#pull--run-no-btrfsoverlay-required))
+- `python3` dependency replaced with (much smaller) `jq`
+- `i686` maps to Docker's `386` arch (eg: [iSH](#using-shocker-on-ios-ish) on iOS)
+- `--debug` flag: traces each command w/ elapsed seconds & line number
+- `--key=val` flags fixed — key is now uppercased, so eg: `--dest=mydir` sets `SHOCKER_DEST`
+
 ### Things that still require the same host setup as bocker
 - `btrfs` filesystem mounted at `/var/shocker` (see below)
 - `bridge0` network bridge already configured (or gets created)
@@ -287,7 +296,7 @@ shocker run -v $HOME/shocker:/app -v /var/shocker --rm -it debian:trixie sh
   # NOTE: for `apt update` or similar you might find your `/tmp` needs sticky bit set, eg:
   chmod 1777 /tmp
   apt-get update  -yqq
-  apt-get install -yqq btrfs-progs curl python3 iproute2 iptables util-linux coreutils bash
+  apt-get install -yqq btrfs-progs curl jq iproute2 iptables util-linux coreutils bash
 
   /app/shocker pull alpine
   /app/shocker run --rm -it alpine sh -c 'cat /etc/issue'
@@ -395,7 +404,7 @@ podman machine ssh
 sudo su -
 
 # install shocker dependencies (Fedora CoreOS uses dnf)
-dnf install -y btrfs-progs curl python3 iptables util-linux coreutils bash
+dnf install -y btrfs-progs curl jq iptables util-linux coreutils bash
 
 # download shocker
 curl https://raw.githubusercontent.com/traceypooh/shocker/refs/heads/master/shocker > shocker
@@ -415,7 +424,7 @@ mount -o loop /var/shocker.img /var/shocker
 The podman VM persists between `podman machine stop` / `podman machine start` but the btrfs mount does not survive reboots — re-run the `mount` line after restarting.
 
 
-## pull-only: no btrfs/overlay required
+## pull & run: no btrfs/overlay required
 
 If you just need a Docker image unpacked into a plain directory — no `/var/shocker`, no btrfs, no overlay, no host setup at all — there's a standalone [`pull`](pull) script for that:
 
@@ -435,8 +444,62 @@ SHOCKER_DEST=mydir shocker pull alpine
 shocker --dest=mydir pull alpine
 ```
 
-There's no `shocker run` equivalent in this mode — that needs cgroups/btrfs snapshots/networking — but for quick poking around, `chroot` + `unshare` (may need `sudo`) gets you process isolation too:
+You can then `shocker run` that directory directly — pass a path instead of an image name:
 
 ```sh
-unshare -fmup chroot mydir /bin/sh
+shocker run -it ./mydir
+shocker run -e FOO=bar ./mydir sh -c 'echo $FOO'
+```
+
+This "lite" run uses the image's `ENTRYPOINT`/`CMD`, `WORKDIR` and `ENV` like a normal `run`, but:
+- runs **in place** — changes persist in `mydir` (`--rm` is ignored)
+- uses the **host's network** (copies in host `/etc/resolv.conf`) — no bridge/veth/netns
+- no cgroups (cpu/memory limits)
+- uses `unshare` for mount/pid/uts/ipc namespaces if it works, otherwise plain `chroot`
+- `ps`, `exec`, `logs`, `commit` don't apply
+
+Under the hood it's basically:
+
+```sh
+unshare -fmuip chroot mydir /bin/sh
+```
+
+
+## Using shocker on iOS (iSH)
+
+Yes, really: **containers on a phone** 📱🧟.
+
+[iSH](https://ish.app) is an Alpine Linux shell for iPhone/iPad (emulated 32-bit x86).
+It has no btrfs, namespaces, cgroups, or bridge networking — but the [lite run](#pull--run-no-btrfsoverlay-required) above works:
+
+```sh
+apk add bash curl jq
+
+shocker --dest=alp pull alpine   # iSH's i686 => pulls the linux/386 image
+shocker run -it ./alp
+
+# inside: networking & apk work
+wget -qO- https://example.com | head -3
+apk add bash
+```
+
+Notes:
+- iSH has no `unshare` syscall, so it's a plain `chroot` (no PID isolation — `ps` shows the phone's processes).
+- inside, `pwd` may show the path from *outside* the chroot (eg: `/root/alp`) and `cd ..` fails — an iSH quirk; you really are at the image's `/`.
+
+
+```sh
+apk add bash curl jq
+curl -fsSLO https://raw.githubusercontent.com/traceypooh/shocker/HEAD/shocker
+chmod +x shocker
+
+./shocker --dest=alp pull alpine
+
+cat /etc/alpine-release
+./shocker run -it ./alp
+ls
+cat /etc/alpine-release
+apk add -q figlet
+figlet wtf
+exit
 ```
