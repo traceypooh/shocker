@@ -470,26 +470,35 @@ unshare -fmuip chroot mydir /bin/sh
 
 Yes, really: **containers on a phone** 📱🧟.
 
-[iSH](https://ish.app) is an Alpine Linux shell for iPhone/iPad (emulated 32-bit x86).
-It has no btrfs, namespaces, cgroups, or bridge networking — but the [lite run](#pull--run-no-btrfsoverlay-required) above works:
+Two Alpine Linux shell apps for iPhone/iPad work.  Neither has btrfs, cgroups, or bridge networking —
+but the [lite run](#pull--run-no-btrfsoverlay-required) above works on both:
+
+- **[iSH-AOK](https://github.com/emkey1/ish-AOK)** (suggested) — a fork of iSH, installed via TestFlight (easy to set up).
+  Modern Alpine, multiple archs (eg: `aarch64` => pulls `linux/arm64` images), much faster, and **real namespaces**:
+  after `apk add util-linux-misc`, `shocker run` gets its own PID namespace (`echo $$` => `1`, `ps` shows only itself)
+  and hostname.
+- **[iSH](https://ish.app)** — on the App Store, but locked to an older, unsupported Alpine version.
+  Emulated 32-bit x86 (`i686` => pulls `linux/386` images).  No `unshare` syscall, so it's a plain `chroot`
+  (no PID isolation — `ps` shows the phone's processes).
 
 ```sh
 apk add bash curl jq
+apk add util-linux-misc          # iSH-AOK only: real `unshare` => namespaces
 
-shocker --dest=alp pull alpine   # iSH's i686 => pulls the linux/386 image
+shocker --dest=alp pull alpine   # pulls the image matching `uname -m`
 shocker run -it ./alp
 
 # inside: networking & apk work
 wget -qO- https://example.com | head -3
-apk add bash
+apk add figlet
 ```
 
 Notes:
-- iSH has no `unshare` syscall, so it's a plain `chroot` (no PID isolation — `ps` shows the phone's processes).
-- inside, `pwd` may show the path from *outside* the chroot (eg: `/root/alp`) and `cd ..` fails — an iSH quirk; you really are at the image's `/`.
+- pull into the app's own filesystem (eg: `/root`, `/tmp`) — **not** a dir mounted from another iOS app (`mount -t ios`). Those can't hold symlinks or ownership, so nearly everything in the image (`/bin/sh` => `/bin/busybox`, etc.) breaks.
+- `apk add util-linux-misc`, not busybox's `unshare` — shocker's `unshare` probe needs the util-linux one.
 
 
-### iSH app on iPhone example run:
+### iSH app on iPhone example run (plain iSH, shown here):
 ```sh
 apk add bash curl jq
 curl -fsSLO https://raw.githubusercontent.com/traceypooh/shocker/HEAD/shocker
