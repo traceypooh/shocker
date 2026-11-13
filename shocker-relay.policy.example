@@ -1,0 +1,39 @@
+# shocker-relay policy -- every container (the first one & each hop) must pass these rules.
+#
+#   <action> <kind> <pattern> [first|hops]
+#
+# Rules are checked top-down: top match wins.  Nothing matches => reject (the container isn't run; a hop gets "resume 125").
+#   kinds:   image  image name, as given (use full names), eg: registry.example.com/team/tool
+#            flag   a `docker run` flag, eg: --privileged
+#            vol    a -v (or --mount type=bind) host path -- the real one: .. & symlinks resolved
+#                   (drop rules also match the path as given: dropping never grants anything)
+#            env    an -e variable's name
+#   actions: allow
+#            reject
+#            drop   remove it (& its value), log it, run the container anyway  (flag, vol, env)
+#            ro     mount it read-only                                          (vol)
+#   pattern: bash regex (ERE) -- anchor it!  ${VAR} becomes that env var's value (regex-escaped),
+#            eg: a per-job id, so a hop can only mount its own job's dir.  (VAR unset or empty:
+#            the rule is skipped -- eg: for optional features.)
+#   first|hops: rule applies only to the first container, or only to hops (default: both)
+
+# images: only from our registry
+allow   image  ^registry\.example\.com/team/
+
+# flags shocker-relay implements (any other must be dropped or rejected)
+allow   flag   ^(--rm|--name|--net|--network|-e|--env|-v|--volume|--mount|--tmpfs|-m|--memory)$
+# docker-only flags that some requests still send, & that mean nothing here: drop (logged).
+# Once the logs show none, change them to reject.
+drop    flag   ^(--cpus|--memory-reservation|--init)$
+reject  flag   ^--privileged$
+
+# volumes
+# (/var/run is often a symlink to /run -- & rules match real paths)
+drop    vol    ^(/var)?/run/docker\.sock$
+ro      vol    ^/etc/myapp/
+allow   vol    ^/srv/jobs/${JOB_ID}(/|$)
+# only the first container gets the ssh agent
+allow   vol    ^/tmp/ssh-[^/]+/agent\.[0-9]+$  first
+
+# env: anything (each container's env starts empty -- only what's asked for is set)
+allow   env    .

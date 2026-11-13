@@ -1,5 +1,5 @@
 # shocker
-Docker implemented in around 300 lines of bash ⚡️
+Docker implemented in around 500 lines of bash ⚡️
 
 Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
 
@@ -13,7 +13,13 @@ Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
     * [Fourth pass of fixes/improvements](#fourth-pass-of-fixesimprovements)
     * [Fifth pass of fixes/improvements](#fifth-pass-of-fixesimprovements)
     * [Sixth pass of fixes/improvements](#sixth-pass-of-fixesimprovements)
+    * [Seventh pass: overlayfs & rootless](#seventh-pass-overlayfs--rootless)
+  * [Storage: btrfs or overlayfs](#storage-btrfs-or-overlayfs)
+  * [Rootless](#rootless)
+  * [shocker-relay: containers that start containers, w/o docker.sock](#shocker-relay-containers-that-start-containers-wo-dockersock)
   * [btrfs /var/shocker setup](#btrfs-varshocker-setup)
+  * [Debugging: --debug & --snitch](#debugging---debug----snitch)
+  * [Tests](#tests)
   * [Building images](#building-images)
   * [proxy / private registry](#proxy--private-registry)
   * [Functionality: Not Yet Implemented](#functionality-not-yet-implemented)
@@ -30,23 +36,24 @@ Fork of bocker (github.com/p8952/bocker). updated & expanded for 2026.
 
 The following packages are needed to run shocker.
 
-* btrfs-progs
 * curl
 * jq
-* iproute2
-* iptables
 * util-linux
 * coreutils
 * bash
+* iproute2, iptables -- only for `--net=bridge` (the default when run as root)
+* btrfs-progs -- optional, only for the [btrfs backend](#storage-btrfs-or-overlayfs)
 
 Additionally your system will need or gets configured with the following:
 
-* A `btrfs` filesystem mounted under `/var/shocker` (see below for setup help)
-* A network bridge called `bridge0` and an IP of 10.0.0.1/24 (gets created if missing)
-* IP forwarding enabled in `/proc/sys/net/ipv4/ip_forward` (gets created if missing)
-* `iptables` NAT and FORWARD rules for `bridge0` (gets created if missing)
+* An image store at `/var/shocker` (or `$SHOCKER_ROOT`): any local filesystem works via overlayfs
+  (nothing to set up), or mount `btrfs` there (see [below](#btrfs-varshocker-setup)) & it's used instead
+* For `--net=bridge`:
+  * A network bridge called `bridge0` and an IP of 10.0.0.1/24 (gets created if missing)
+  * IP forwarding enabled in `/proc/sys/net/ipv4/ip_forward` (gets created if missing)
+  * `iptables` NAT and FORWARD rules for `bridge0` (gets created if missing)
 
-You probably still want to **run shocker in a virtual machine**. `shocker` runs as `root` and among other things, makes changes to your network interfaces, routing table, and firewall rules.
+You probably still want to **run shocker in a virtual machine**. Run as `root`, `shocker` among other things makes changes to your network interfaces, routing table, and firewall rules. (Or run it as a regular user: see [Rootless](#rootless).)
 
 **We can make no guarantees that it won't trash your system**.
 
@@ -127,6 +134,7 @@ Fri May 22 23:54:38 UTC 2026
 * `docker rm` / `docker rmi`
 * Networking
 * Quota Support / CGroups
+* Data Volumes (`-v src[:dst][:ro]`)
 
 † `shocker init` is a `docker import` equivalent — it promotes a local directory into a shocker image. For a proper build workflow, see [Building images](#building-images) below.
 
@@ -179,11 +187,111 @@ Fri May 22 23:54:38 UTC 2026
 - `--debug` flag: traces each command w/ elapsed seconds & line number
 - `--key=val` flags fixed — key is now uppercased, so eg: `--dest=mydir` sets `SHOCKER_DEST`
 
+### Seventh pass: overlayfs & rootless
+- **overlayfs backend** — used when the image store isn't btrfs, so no filesystem setup is needed (see [Storage](#storage-btrfs-or-overlayfs))
+- **rootless mode** — run as a regular user, in a user namespace (see [Rootless](#rootless))
+- `run --net=bridge|host|none` — bridge (the default as root) as before; `host` shares the host's network; `none` is loopback only
+- `run -v src:dst:ro` — read-only volumes; fails rather than silently mounting read-write
+- `run -v /opt/blah` or `-v /opt/blah:ro` — no `dst` means the same path inside (like `systemd-nspawn --bind`; unlike docker, where it makes an anonymous volume)
+- `-v` destinations resolve inside the container root (an image symlink is followed within the image, not onto the host); a missing `-v` source is an error
+- `run` returns the command's exit status (it was always swallowed); non-interactive runs get `/dev/null` as stdin, like docker
+- killing a container's `unshare` kills everything in it (`--kill-child`); container mounts never propagate back to the host
+- deletes (`rm`, `--rm`, re-pull) unmount first & never cross into another filesystem — a leaked mount can't take host files with it
+- `--debug` timestamps are now wall clock μs; new `--snitch` (see [Debugging](#debugging---debug----snitch))
+- `pull` saves the image's digest & skips the download when the registry's is unchanged (a `HEAD` request: cheap, & not counted against Docker Hub's pull limits)
+- new `prune` — deletes images replaced by newer pulls (`_none_` in `shocker images`), unless a container is built on one or a running process names it; & orphaned containers: `--rm` runs that died before cleaning up (eg: SIGKILL, reboot).  Each `--rm` run holds a lock (`.rm/<id>`) that all its processes inherit, so a container still running is never touched, & kept containers (no `--rm`) are left alone.  Eg: from cron
+- tests: `tests/rootless.sh` & `tests/relay.sh`, run by GitHub Actions on each push (see [Tests](#tests))
+- new **`shocker-relay`** — lets a container start other containers, each checked against a policy, w/o `docker.sock` (see [shocker-relay](#shocker-relay-containers-that-start-containers-wo-dockersock))
+
 ### Things that still require the same host setup as bocker
-- `btrfs` filesystem mounted at `/var/shocker` (see below)
+Only when run as root w/ `--net=bridge` (the default as root):
 - `bridge0` network bridge already configured (or gets created)
 - ip / `iptables` for NAT (same as before)
 - Running as root 🤠
+
+## Storage: btrfs or overlayfs
+Images & containers live in `/var/shocker` (or `$SHOCKER_ROOT`).  shocker picks how to make
+copy-on-write containers from what that dir is on:
+- **btrfs** (if `/var/shocker` is a btrfs filesystem): each image is a subvolume; each container
+  a snapshot of it.  `commit` is a free snapshot too.
+- **overlayfs** (anything else, eg: ext4, xfs, tmpfs): each image is a plain dir; each container
+  an overlay mount w/ the image as its read-only lower layer & its writes in
+  `.overlay/<container_id>/upper`.  Nothing to install or set up.  `commit` is a copy
+  (`cp --reflink=auto`).
+
+Either way, starting a container takes the same (tiny) time regardless of image size.
+`--fs=btrfs` or `--fs=overlay` forces one.  The overlay store can't be on overlayfs itself (eg:
+inside a docker container) or NFS.
+
+## Rootless
+Run shocker as a regular user & it re-execs itself inside a new user + mount namespace
+(`unshare --map-root-user`): root inside, you outside.  No sudo, no daemon, no setuid helpers.
+```sh
+# once, as root: the rootless image store, for the one user who'll run shocker
+install -d -o myuser -m700 /var/shocker-rootless
+
+shocker pull alpine          # images go to /var/shocker-rootless (or $SHOCKER_ROOT)
+shocker run --rm alpine id   # uid=0(root) inside; files it writes to -v volumes are yours
+```
+Differences from running as root:
+- **networking:** `--net=host` (the rootless default) or `--net=none`; no bridge
+- **file ownership:** pulled image files are all owned by root inside (ownership is flattened);
+  an image's `USER` is ignored
+- **memory limit:** `SHOCKER_MEM_LIMIT` is enforced via a systemd user scope
+  (`systemd-run --user --scope -p MemoryMax=…`) when your user has a systemd manager (a login
+  session, or `loginctl enable-linger $USER`); otherwise shocker warns & runs unlimited.  Like
+  `docker --memory`, an OOM kills the biggest process, not the whole container.  No CPU limit.
+- **mounts** only live while shocker runs; a kept container (no `--rm`) is remounted as needed
+  for `ps`, `logs` & `commit`
+- **btrfs:** untested rootless (deleting a subvolume as non-root needs the
+  `user_subvol_rm_allowed` mount option); overlay is the tested route
+
+Needs util-linux `unshare` & unprivileged user namespaces (overlay inside one: Linux 5.11+).  Some
+distros restrict those, eg: Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns`.
+
+## shocker-relay: containers that start containers, w/o docker.sock
+A common pattern: a job runs in one container, & starts tool containers as it goes (CI runners,
+pipelines, workers).  W/ docker, that means mounting `docker.sock` into the job -- which is root on
+the host for anything that can reach it.
+
+`shocker-relay` (in this repo) runs the first container w/ shocker, & gives it a fifo instead.  To
+start another container (a "hop"), a program inside writes that container's `docker run` args, as
+one JSON array line, & waits for the exit status:
+```sh
+# inside the first container
+echo '["--rm", "-v", "/srv/jobs/42:/data", "registry.example.com/team/tool", "process", "/data"]' \
+  > "$SHOCKER_RELAY_FIFO/ready.fifo"
+read -r _ rc < "$SHOCKER_RELAY_FIFO/resume.fifo"   # "resume <exit status>"; 125: refused
+```
+`shocker-relay` runs each hop *next to* the first container (not inside it), one at a time, & exits
+w/ the first container's exit status.
+
+Requests come from inside, so they're untrusted: **every container -- the first one too -- must pass
+a policy file.**  Rules allow, reject, drop (& log) or make read-only each image, `docker run` flag,
+volume & env var.  Rules are checked top-down: top match wins; no match means refused.  Volume rules match the real path
+(`..` & symlinks resolved), & `${VAR}` in a rule is that env var's value, eg: confine every hop to
+its own job's dir:
+```sh
+allow   image  ^registry\.example\.com/team/
+allow   flag   ^(--rm|--name|-e|-v|--volume)$
+drop    vol    ^(/var)?/run/docker\.sock$
+allow   vol    ^/srv/jobs/${JOB_ID}(/|$)
+# only the first container gets the ssh agent
+allow   vol    ^/tmp/ssh-[^/]+/agent\.[0-9]+$  first
+allow   env    .
+```
+```sh
+JOB_ID=42 shocker-relay --policy=my.policy --creds-host=registry.example.com -- \
+  -v /srv/jobs/42:/srv/jobs/42 registry.example.com/team/runner ./run-job.sh
+```
+See [`shocker-relay.policy.example`](shocker-relay.policy.example) for the rule syntax, & the top
+of [`shocker-relay`](shocker-relay) for its options: re-pulling stale images (`--max-age`), only
+sending registry creds to one host (`--creds-host`), a hook that adds flags to each hop
+(`--hop-hook`, eg: `--mount type=image`), logging to syslog & which `docker run` flags it
+implements.
+
+Run rootless, nothing in any of the containers can do more than the user running `shocker-relay`.
+(Think OpenSSH's privilege-separation monitor: the untrusted side can only *ask*.)
 
 ## btrfs /var/shocker setup
 ```sh
@@ -203,6 +311,23 @@ mount -o loop /var/shocker.img /var/shocker
 # 5. Persist across reboots
 echo '/var/shocker.img /var/shocker btrfs loop 0 0' >> /etc/fstab
 ```
+
+## Debugging: --debug & --snitch
+Global flags go before the command, eg: `shocker --debug --snitch run --rm alpine apk add curl`
+- `--debug` traces every command shocker runs, prefixed w/ the wall clock (μs) & line number --
+  handy for spotting slow or stuck steps
+- `--snitch` (overlay): after a run, lists what the container wrote *outside* its `-v` volumes
+  (its overlay upper layer), biggest first -- eg: to find scratch files a program leaves in the
+  image instead of where you expected.  Type `c` = a file it deleted from the image.
+
+## Tests
+Run as a regular user (rootless; each uses a temp image store & pulls alpine):
+```sh
+tests/rootless.sh   # pull (& digest skip), run, -v/:ro/-e/--net, ps/logs/commit/rm, prune
+tests/relay.sh      # shocker-relay: a first container makes ~20 hop requests -- allowed,
+                    # refused (escapes, images, flags, env), dropped -- checked against a policy
+```
+GitHub Actions runs both on each push ([`.github/workflows/test.yml`](.github/workflows/test.yml)).
 
 ## Building images
 
@@ -249,7 +374,6 @@ fetches a JWT from the `realm` URL using the supplied credentials.
 ## Functionality: Not Yet Implemented
 
 * Data Volume Containers
-* Data Volumes
 * Port Forwarding
 
 ## License

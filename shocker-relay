@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# shocker-relay — run a container that can ask for more containers ("hops"), one at a time, w/o a
+# docker.sock.  Uses `shocker` (same repo), so rootless works too.
+#
+#   shocker-relay --policy=FILE [options] [--] [docker run flags] IMAGE [CMD…]
+#
+# Runs IMAGE w/ `shocker run`, w/ a fifo dir mounted at /fifo (& env SHOCKER_RELAY_FIFO=/fifo).
+# To run a hop, a program inside writes that container's `docker run` args, as one JSON array line,
+# to /fifo/ready.fifo, eg:  ["--rm", "-v", "/data:/data", "registry.example.com/team/tool", "-h"]
+# then reads "resume <exit status>" from /fifo/resume.fifo.  shocker-relay checks the request
+# against the policy, pulls the image if stale, & runs it -- next to the first container, not inside
+# it -- then writes back its exit status (125: refused, or couldn't start).  When the first
+# container exits, so does shocker-relay, w/ its exit status.
+#
+# Hop requests come from inside, so they're untrusted: every container -- the first one too -- must
+# pass the --policy rules (see shocker-relay.policy.example).  Run rootless, nothing can do more
+# than the user running shocker-relay.  (Unlike a docker.sock, which is root to anyone who can
+# reach it.)
+#
+# options:
+#   --policy=FILE       (required) rules for every container's image, flags, volumes & env
+#   --creds-host=HOST   only pulls from this registry get any SHOCKER_REGISTRY_USER &
+#                       SHOCKER_REGISTRY_PASS.  (Use full image names, eg:
+#                       registry.example.com/team/tool -- a name w/o a host means Docker Hub.)
+#   --max-age=SECS      re-pull a hop's image when its last pull is older (default: 3600).
+#                       The first container's image is only pulled when missing.
+#   --fifo=DIR          the fifo dir (default: a temp dir).  Must be new or empty.
+#   --scratch=DIR       where --tmpfs dirs go (default: a temp dir)
+#   --hop-hook=CMD      run (`bash -c`) before each hop; each line it prints is one more `docker run`
+#                       flag for that hop, eg: --mount=type=image,source=IMG,destination=/opt/x
+#                       (the policy checks those too)
+#   --logtag=NAME       log prefix & syslog tag (default: shocker-relay)
+#   --syslog=PRIORITY   syslog priority (default: user.info)
+#
+# docker run flags shocker-relay implements -- any other must be dropped (or rejected) by the policy:
+#   --rm (always)  --name  --net|--network  -e|--env NAME=VAL  -v|--volume  -m|--memory
+#   --mount type=image|bind,source=…,destination=…[,readonly]   --tmpfs (as a scratch dir)
+
+set -o errexit -o nounset -o pipefail
+
+POLICY='' CREDS_HOST='' MAX_AGE=3600 FIFO='' SCRATCH_DIR='' HOOK='' LOGTAG=shocker-relay PRI=user.info
+while [[ $# -gt 0 && "$1" == --* ]]; do
+  case "$1" in
+    --policy=*)     POLICY="${1#*=}" ;;
+    --creds-host=*) CREDS_HOST="${1#*=}" ;;
+    --max-age=*)    MAX_AGE="${1#*=}" ;;
+    --fifo=*)       FIFO="${1#*=}" ;;
+    --scratch=*)    SCRATCH_DIR="${1#*=}" ;;
+    --hop-hook=*)   HOOK="${1#*=}" ;;
+    --logtag=*)     LOGTAG="${1#*=}" ;;
+    --syslog=*)     PRI="${1#*=}" ;;
+    --) shift; break ;;
+    *) break ;;  # (the first container's own docker run flags)
+  esac
+  shift
+done
+[[ -n "$POLICY" && $# -gt 0 ]] || { sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+
+# shocker's image store: where `shocker images` ids live (rootfull -v- rootless have different dirs)
+STORE="${SHOCKER_ROOT:-}"
+[[ -n "$STORE" ]] || { [[ $(id -u) == 0 ]] && STORE=/var/shocker || STORE=/var/shocker-rootless; }
+
+
+# (stdout may be a connection that drops -- then writes fail; that's ok)
+function log() {
+  { echo "[$LOGTAG] $*"; } 2>/dev/null || true
+  logger -t "$LOGTAG" -p "$PRI" -- "$*" 2>/dev/null || true
+}
+function die() { log "$*"; exit 2; }
+
+
+# ---- policy ----
+# Lines: <action> <kind> <pattern> [first|hops].  Top match wins; no match => reject.
+#   kinds: image (full name), flag (eg: --privileged), vol (host path, .. & symlinks resolved),
+#          env (variable name)
+#   actions: allow, reject, drop (remove it & log; flag, vol, env), ro (vol: mount read-only)
+#   pattern: bash regex (ERE).  ${VAR} is replaced w/ that env var's value, escaped.
+#            (VAR unset or empty: the rule is skipped)
+#   first|hops: only for the first container, or only for hops (default: both)
+P_ACT=() P_KIND=() P_PAT=() P_SCOPE=()
+function re_escape() { sed 's/[][\.*^$+?(){}|/]/\\&/g' <<< "$1"; }
+n=0
+while read -r act kind pat scope rest; do
+  n=$((n+1))
+  [[ -z "${act:-}" || "$act" == \#* ]] && continue
+  bad="$POLICY:$n: bad rule"
+  [[ -n "${pat:-}" && -z "${rest:-}" ]] || die "$bad (want: action kind pattern [first|hops])"
+  case "$kind" in image|flag|vol|env) ;; *) die "$bad: kind $kind" ;; esac
+  case "$act:$kind" in
+    allow:*|reject:*|drop:flag|drop:vol|drop:env|ro:vol) ;;
+    *) die "$bad: $act $kind" ;;
+  esac
+  case "${scope:-}" in ''|first|hops) ;; *) die "$bad: scope $scope" ;; esac
+  skip=''
+  while [[ "$pat" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+    var="${BASH_REMATCH[1]}"
+    [[ -n "${!var:-}" ]] || { skip=x; break; }
+    pat="${pat//"\${$var}"/$(re_escape "${!var}")}"
+  done
+  [[ -n "$skip" ]] && continue
+  { [[ x =~ $pat ]] || [[ $? -ne 2 ]]; } || die "$bad: regex $pat"
+  P_ACT+=("$act") P_KIND+=("$kind") P_PAT+=("$pat") P_SCOPE+=("${scope:-}")
+done < "$POLICY"
+
+SCOPE=first  # (then: hops)
+function policy() { # <kind> <value> -- echoes the topmost matching rule's action, else reject
+  local i
+  for i in "${!P_ACT[@]}"; do
+    [[ "${P_KIND[$i]}" == "$1" && ( -z "${P_SCOPE[$i]}" || "${P_SCOPE[$i]}" == "$SCOPE" ) ]] \
+      && [[ "$2" =~ ${P_PAT[$i]} ]] && { echo "${P_ACT[$i]}"; return; }
+  done
+  echo reject
+}
+
+
+# ---- images ----
+function has_host() { [[ "${1%%/*}" == *.* || "${1%%/*}" == *:* || "${1%%/*}" == localhost ]]; }
+
+function image_id() { # <image> -- its shocker id (img-…), if pulled
+  local name="$1"
+  has_host "$name" && name="${name#*/}"
+  [[ "${name##*/}" == *:* ]] || name="$name:latest"
+  shocker images | awk -F'\t+' -v n="$name" '$2 == n { id = $1 } END { print id }'
+}
+
+function pull() { # <image> <max age secs | missing>
+  local img="$1" id age
+  id=$(image_id "$img")
+  if [[ -n "$id" ]]; then
+    [[ "$2" == missing ]] && return 0
+    age=$(( $(date +%s) - $(date -r "$STORE/$id/shocker/source" +%s) ))
+    [[ $age -lt $2 ]] && return 0
+  fi
+  log "pulling $img"
+  (
+    unset SHOCKER_REGISTRY
+    has_host "$img" && export SHOCKER_REGISTRY="${img%%/*}" && img="${img#*/}"
+    # (credentials only go to --creds-host)
+    [[ -n "$CREDS_HOST" && "${SHOCKER_REGISTRY:-}" == "$CREDS_HOST" ]] \
+      || unset SHOCKER_REGISTRY_USER SHOCKER_REGISTRY_PASS
+    shocker pull "$img"
+  )
+}
+
+
+# ---- docker run args => shocker run args ----
+# flags that take a value -- so dropping one drops its value too
+VALUE_FLAGS=' --name --net --network -e --env -v --volume --mount --tmpfs -m --memory --cpus
+  --memory-reservation --memory-swap --gpus --runtime --device --cap-add --cap-drop --shm-size
+  --ulimit --label -l --user -u --workdir -w --entrypoint --hostname -h --add-host --security-opt '
+VALUE_FLAGS="${VALUE_FLAGS//$'\n'/ }"
+NSCRATCH=0 SCRATCH=()
+
+# Sets IMG (shocker id) NAME SH_ARGS CMD MEM_MB -- or returns 1 w/ the reason in WHY
+function translate() { # <docker run args…>
+  # (shocker's default is a 512 MiB memory limit -- docker's is none, so ours is ~none too)
+  IMG='' NAME='' SH_ARGS=() CMD=() MEM_MB=1048576 WHY=''
+  local arg val img
+  while [[ $# -gt 0 ]]; do
+    arg="$1"; shift
+    if [[ "$arg" == --*=* ]]; then set -- "${arg#*=}" "$@"; arg="${arg%%=*}"; fi
+    if [[ "$arg" != -* ]]; then img="$arg"; CMD=("$@"); break; fi
+    val=''
+    if [[ "$VALUE_FLAGS" == *" $arg "* ]]; then
+      [[ $# -gt 0 ]] || { WHY="$arg needs a value"; return 1; }
+      val="$1"; shift
+    fi
+    case $(policy flag "$arg") in
+      reject) WHY="flag $arg"; return 1 ;;
+      drop)   log "dropping $arg${val:+ $val}"; continue ;;
+    esac
+    case "$arg" in
+      --rm) ;;  # (always)
+      --name) NAME="$val" ;;
+      --net|--network) SH_ARGS+=(--net="$val") ;;
+      -e|--env)
+        # (NAME alone would mean "copy ours" in docker -- never hand our env out)
+        [[ "$val" == [A-Za-z_]*=* ]] || { WHY="-e $val: need NAME=value"; return 1; }
+        case $(policy env "${val%%=*}") in
+          reject) WHY="env ${val%%=*}"; return 1 ;;
+          drop)   log "dropping env ${val%%=*}"; continue ;;
+        esac
+        SH_ARGS+=(-e "$val") ;;
+      -v|--volume) volume "$val" || return 1 ;;
+      --mount) mount_arg "$val" || return 1 ;;
+      --tmpfs)
+        # (shocker has no tmpfs -- a scratch dir instead, removed after the container)
+        val="${val%%:*}"
+        local dir="$SCRATCH_DIR/$((++NSCRATCH))$val"
+        mkdir -p "$dir" && SCRATCH+=("$dir")
+        SH_ARGS+=(-v "$dir:$val") ;;
+      -m|--memory)
+        case "${val,,}" in
+          *g) MEM_MB=$(( ${val%?} * 1024 )) ;;
+          *m) MEM_MB=${val%?} ;;
+          *)  WHY="--memory $val: want eg: 512m or 4g"; return 1 ;;
+        esac ;;
+      *) WHY="$arg: not implemented -- the policy must drop or reject it"; return 1 ;;
+    esac
+  done
+  [[ -n "${img:-}" ]] || { WHY="no image"; return 1; }
+  [[ $(policy image "$img") == allow ]] || { WHY="image $img"; return 1; }
+  pull "$img" "$( [[ $SCOPE == first ]] && echo missing || echo "$MAX_AGE" )" \
+    || { WHY="pull $img failed"; return 1; }
+  IMG=$(image_id "$img")
+  [[ -n "$IMG" ]] || { WHY="no $img after pull"; return 1; }
+  NAME="${NAME:-$img}"
+}
+
+function volume() { # <src[:dst][:ro|:rw]>
+  local v="$1" ro='' src dst
+  case "$v" in *:ro) ro=:ro v="${v%:ro}" ;; *:rw) v="${v%:rw}" ;; esac
+  src="${v%%:*}"
+  [[ "$v" == *:* ]] && dst="${v#*:}" || dst="$src"
+  [[ "$src" == /* ]] || { WHY="-v $1: named volumes aren't supported"; return 1; }
+  # dropping never grants anything, so `drop` rules may match the path as given, too
+  # (eg: a symlink named like a dropped file)
+  [[ $(policy vol "$(realpath -s -m -- "$src")") == drop ]] && { log "dropping -v $1"; return 0; }
+  # otherwise match (& mount) the real path: no escaping an allowed dir via .. or a symlink
+  local real; real=$(realpath -m -- "$src")
+  [[ "$real" == "$src" ]] || src="$src (real path: $real)"
+  case $(policy vol "$real") in
+    reject) WHY="-v $src"; return 1 ;;
+    drop)   log "dropping -v $1"; return 0 ;;
+    ro)     ro=:ro ;;
+  esac
+  SH_ARGS+=(-v "$real:$dst$ro")
+}
+
+function mount_arg() { # type=image|bind,source=…,destination=…[,readonly]
+  local type='' src='' dst='' ro='' kv kvs
+  IFS=, read -ra kvs <<< "$1"
+  for kv in "${kvs[@]}"; do
+    case "$kv" in
+      type=*) type="${kv#*=}" ;;
+      source=*|src=*) src="${kv#*=}" ;;
+      destination=*|dst=*|target=*) dst="${kv#*=}" ;;
+      readonly|ro|readonly=true|ro=true) ro=:ro ;;
+      *) WHY="--mount $1: unsupported $kv"; return 1 ;;
+    esac
+  done
+  [[ -n "$src" && "$dst" == /* ]] || { WHY="--mount $1: need source & destination"; return 1; }
+  case "$type" in
+    bind) volume "$src:$dst$ro" ;;
+    image)
+      # (like podman: another image's whole root, read-only)
+      local img="$src" id
+      [[ $(policy image "$img") == allow ]] || { WHY="--mount image $img"; return 1; }
+      pull "$img" "$MAX_AGE" || { WHY="pull $img failed"; return 1; }
+      id=$(image_id "$img")
+      [[ -n "$id" ]] || { WHY="no $img after pull"; return 1; }
+      log "mounting $img at $dst"
+      SH_ARGS+=(-v "$STORE/$id:$dst:ro") ;;
+    *) WHY="--mount $1: type must be image or bind"; return 1 ;;
+  esac
+}
+
+
+# ---- signals & cleanup ----
+# shocker puts each container under an `unshare --kill-child` -- TERMing that kills the container,
+# then `shocker run` cleans up & returns.
+FIRST_PID='' HOP_PID='' SENTINEL_PID='' MADE_FIFOS='' MADE_SCRATCH=''
+
+function kill_containers() {
+  local pid
+  for pid in $HOP_PID $FIRST_PID; do pkill -TERM -x unshare -g "$pid" 2>/dev/null || true; done
+}
+function stop() { # <signal>
+  # (syslog only: on HUP/PIPE our stdout is likely gone)
+  logger -t "$LOGTAG" -p "$PRI" -- "stopping containers ($1)" 2>/dev/null || true
+  kill_containers
+}
+function cleanup() {
+  kill_containers
+  [[ -n "$SENTINEL_PID" ]] && kill "$SENTINEL_PID" 2>/dev/null || true
+  [[ -n "$MADE_FIFOS" ]] && rm -f "$FIFO/ready.fifo" "$FIFO/resume.fifo"
+  [[ ${#SCRATCH[@]} -gt 0 ]] && rm -rf --one-file-system "${SCRATCH[@]}"
+  [[ -n "$MADE_SCRATCH" ]] && rm -rf --one-file-system "$SCRATCH_DIR"
+  # (only if empty -- ours or not)
+  [[ -n "$FIFO" ]] && rmdir "$FIFO" 2>/dev/null || true
+  [[ -n "$SCRATCH_DIR" ]] && rmdir "$SCRATCH_DIR" 2>/dev/null || true
+  return 0
+}
+for sig in HUP TERM PIPE INT; do trap "stop $sig" $sig; done  # (cleanup runs at EXIT)
+trap cleanup EXIT
+
+function wait_for() { # <pid> -- its exit status (`wait` returns early on trapped signals)
+  local rc
+  while true; do
+    wait "$1" && rc=0 || rc=$?
+    kill -0 "$1" 2>/dev/null || return $rc
+  done
+}
+
+
+# ---- first container ----
+for c in shocker curl jq tar unshare setsid realpath logger; do
+  command -v $c >/dev/null || die "missing $c"
+done
+[[ -n "$FIFO" ]] || FIFO=$(mktemp -d)
+[[ -n "$SCRATCH_DIR" ]] || { SCRATCH_DIR=$(mktemp -d); MADE_SCRATCH=x; }
+mkdir -p -m700 "$FIFO" "$SCRATCH_DIR"
+[[ -z "$(ls -A "$FIFO")" ]] || die "--fifo=$FIFO isn't empty"
+mkfifo -m600 "$FIFO/ready.fifo" "$FIFO/resume.fifo" && MADE_FIFOS=x
+
+# start the main/first container
+translate "$@" || die "first container refused: $WHY"
+log "starting $NAME: ${CMD[*]}"
+# own process group (setsid), so we can signal just its container
+SHOCKER_MEM_LIMIT=$MEM_MB setsid shocker run --rm "${SH_ARGS[@]}" -v "$FIFO:/fifo" \
+  -e SHOCKER_RELAY_FIFO=/fifo "$IMG" ${CMD[@]+"${CMD[@]}"} &
+FIRST_PID=$!
+FIRST_NAME=$NAME
+
+# unblocks the loop below when the first container exits, for any reason
+( while kill -0 $FIRST_PID 2>/dev/null; do sleep 0.5; done; echo exit > "$FIFO/ready.fifo" ) &
+SENTINEL_PID=$!
+
+
+# ---- hops ----
+SCOPE=hops
+hop=0
+while true; do
+  msg=''
+  read -r msg < "$FIFO/ready.fifo" || continue  # (interrupted by a trapped signal)
+  [[ "$msg" == exit ]] && break
+  hop=$((hop+1)) RC=125 SECONDS=0 SCRATCH_BEFORE=${#SCRATCH[@]}
+
+  extra=() margs=() out=''
+  if [[ -n "$HOOK" ]] && ! out=$(bash -c "$HOOK"); then
+    log "hop $hop refused: --hop-hook failed"
+  elif ! mapfile -t margs < <(jq -r '.[]' <<< "$msg" 2>/dev/null) || [[ ${#margs[@]} -eq 0 ]]; then
+    log "hop $hop refused: bad request: $msg"
+  else
+    [[ -n "$out" ]] && mapfile -t extra <<< "$out"
+    if ! translate ${extra[@]+"${extra[@]}"} "${margs[@]}"; then
+      log "hop $hop refused: $WHY"
+    else
+      log "hop $hop: $NAME$( [[ $MEM_MB -lt 1048576 ]] && echo " (memory limit ${MEM_MB}M)" )"
+      SHOCKER_MEM_LIMIT=$MEM_MB setsid shocker run --rm "${SH_ARGS[@]}" "$IMG" ${CMD[@]+"${CMD[@]}"} &
+      HOP_PID=$!
+      wait_for $HOP_PID && RC=0 || RC=$?
+      HOP_PID=''
+      log "hop $hop: $NAME exited $RC (${SECONDS}s)"
+    fi
+  fi
+  # this hop's scratch dirs
+  for d in "${SCRATCH[@]:$SCRATCH_BEFORE}"; do rm -rf --one-file-system "$d"; done
+  SCRATCH=("${SCRATCH[@]:0:$SCRATCH_BEFORE}")
+
+  # opening a fifo blocks until the other end opens it -- the requester already has, unless it
+  # died (eg: we were signaled), so don't wait forever
+  timeout 60 bash -c 'echo "resume $1" > "$2"' -- "$RC" "$FIFO/resume.fifo" \
+    || { log "nobody waiting on resume.fifo"; break; }
+done
+
+wait_for $FIRST_PID && RC=0 || RC=$?
+log "$FIRST_NAME exited $RC"
+exit $RC

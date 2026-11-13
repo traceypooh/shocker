@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rootless:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: syntax
+        run: for f in shocker shocker-relay pull tests/*.sh; do bash -n "$f"; done
+
+      # Ubuntu 24.04 blocks unprivileged user namespaces (rootless shocker's foundation) by default
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: shocker (rootless)
+        run: tests/rootless.sh
+
+      - name: shocker-relay (rootless)
+        run: tests/relay.sh
