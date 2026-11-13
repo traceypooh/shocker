@@ -19,13 +19,13 @@ function new_ps()     { ls "$SHOCKER_ROOT" | grep ps- | grep -vx "${1:-}" | head
 
 
 # ---- an empty store, w/ stdin left open (like a terminal): nothing may wait on it ----
-out=$(sleep 30 | timeout 10 $S prune 2>&1); rc=$?
+out=$(timeout 10 $S prune 2>&1 < <(sleep 30)); rc=$?
 check "empty store: prune returns"             '[[ $rc == 0 ]]'
-out=$(sleep 30 | timeout 10 $S run --rm alpine true 2>&1); rc=$?
+out=$(timeout 10 $S run --rm alpine true 2>&1 < <(sleep 30)); rc=$?
 check "empty store: run by name says no image" '[[ $rc == 1 && "$out" == *"No image named"* ]]'
 
 # ---- pull ----
-out=$(sleep 30 | timeout 60 $S pull alpine 2>&1)
+out=$(timeout 60 $S pull alpine 2>&1 < <(sleep 30))
 check "pull: creates an image"                 '[[ "$out" == *"Created: img-"* ]]'
 IMG=$(img_of alpine:latest)
 check "pull: saves the digest"                 'grep -qE "^sha256:[0-9a-f]{64}$" "$SHOCKER_ROOT/$IMG/shocker/digest"'
