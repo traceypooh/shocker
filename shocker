@@ -37,11 +37,13 @@ if [[ $(id -u) != 0 ]]; then
   # (needs a user manager -- an ssh login session, or `loginctl enable-linger $USER`).
   # OOMPolicy=continue: like docker --memory, the kernel kills the biggest process (eg: ffmpeg),
   # not the whole scope -- so we survive to clean up.  No systemd user manager?  No limit.
+  # MemorySwapMax: also like docker (w/o --memory-swap), up to as much swap as memory.
   scope=()
   if [[ "${1:-}" == run && -n "${SHOCKER_MEM_LIMIT:-}" ]] && command -v systemd-run >/dev/null; then
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if systemd-run --user --scope -q true 2>/dev/null; then
-      scope=(systemd-run --user --scope -q -p MemoryMax="${SHOCKER_MEM_LIMIT}M" -p OOMPolicy=continue --)
+      scope=(systemd-run --user --scope -q -p MemoryMax="${SHOCKER_MEM_LIMIT}M"
+        -p MemorySwapMax="${SHOCKER_MEM_LIMIT}M" -p OOMPolicy=continue --)
     else
       echo "rootless: no systemd user manager -- memory limit ${SHOCKER_MEM_LIMIT}M NOT enforced" >&2
     fi
@@ -178,6 +180,8 @@ function _cg_set() { # <id>
     [[ $weight -lt 1 ]] && weight=1
     echo "$weight"                          > /sys/fs/cgroup/"$id"/cpu.weight
     echo "$((SHOCKER_MEM_LIMIT * 1048576))" > /sys/fs/cgroup/"$id"/memory.max
+    # like docker (w/o --memory-swap): up to as much swap as memory  (no swap accounting?  skip)
+    echo "$((SHOCKER_MEM_LIMIT * 1048576))" > /sys/fs/cgroup/"$id"/memory.swap.max 2>/dev/null || true
   elif [[ $CGROUP_VERSION -eq 1 ]]; then
     cgset -r cpu.shares="$SHOCKER_CPU_SHARE"                          "$id"
     cgset -r memory.limit_in_bytes="$((SHOCKER_MEM_LIMIT * 1048576))" "$id"
