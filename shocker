@@ -355,9 +355,15 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   mkdir -p "$dest/shocker"
 
   # rootless: only uid 0 is mapped, so files can't be chown'd to other users -- flatten to root
-  # (-o: don't restore owners; GNU tar & busybox both)
+  # (-o: don't restore owners; GNU tar & busybox both).  Nor can it mknod: skip whatever's under
+  # /dev (some old base images ship device nodes there) -- runs mount the host's /dev over it.
   local -a tar_opts=()
-  [[ $ROOTLESS -eq 1 ]] && tar_opts=(-o)
+  if [[ $ROOTLESS -eq 1 ]]; then
+    tar_opts=(-o)
+    # GNU tar's excludes match after any '/' unless --anchored (busybox's are always anchored)
+    [[ "$(tar --version 2>/dev/null)" == *GNU* ]] && tar_opts+=(--anchored)
+    tar_opts+=(--exclude='dev/?*' --exclude='./dev/?*')
+  fi
 
   while IFS= read -r digest; do
     echo "Pulling layer ${digest:7:19}…"
