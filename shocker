@@ -641,10 +641,12 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [--
   if [[ $interactive -eq 1 ]]; then
     _run_ns "$uuid" "$root" "${#all_vols[@]}" "$workdir" "${all_vols[@]}" "${cmd_args[@]}" || rc=$?
   else
-    # (pipefail: rc is the command's status, not tee's)
     # not -i: stdin is /dev/null, like docker -- never our terminal
+    # (tee via process substitution, not a pipe: a pipe would fork a 2nd shocker bash just to run
+    # _run_ns -- this way unshare is our direct child.  wait: so the log's complete before cleanup)
     _run_ns "$uuid" "$root" "${#all_vols[@]}" "$workdir" "${all_vols[@]}" "${cmd_args[@]}" \
-      < /dev/null 2>&1 | tee "$root/$uuid.log" || rc=$?
+      < /dev/null > >(tee "$root/$uuid.log") 2>&1 || rc=$?
+    wait $! 2>/dev/null || true
   fi
 
   [[ $net == bridge ]] && ip link del dev veth0_"$uuid"
