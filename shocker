@@ -554,8 +554,9 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [--
     # subshell keeps bash's "Bad system call" notice quiet (iSH has no unshare syscall)
     ( "${ns[@]}" true && exit 0; exit 1 ) 2>/dev/null || ns=()
     local rc=0
+    local -a NS_SH; _ns_sh
     nsroot="$img" nvols="${#volumes[@]}" workdir="$workdir" \
-      ${ns[@]+"${ns[@]}"} /bin/sh -c "$_ns_script" -- ${volumes[@]+"${volumes[@]}"} "${cmd_args[@]}" || rc=$?
+      ${ns[@]+"${ns[@]}"} /bin/sh "${NS_SH[@]}" ${volumes[@]+"${volumes[@]}"} "${cmd_args[@]}" || rc=$?
     # no mount namespace => our /dev, /proc & -v mounts landed on the host; undo them all
     [[ ${#ns[@]} -eq 0 ]] && _umount_under "$img"
     return $rc
@@ -726,10 +727,25 @@ _ns_script='
   done
   exec chroot "$nsroot" /bin/sh -c "cd \"$workdir\" && exec \"\$@\"" -- "$@"
 '
+function _ns_sh() { # sets NS_SH: /bin/sh's args to run _ns_script
+  # As a file in the store -- so ps shows `/bin/sh …/.ns.sh <args>`, not the whole script.
+  # (rewritten only when shocker changed it -- & atomically: other runs may be reading it)
+  # Store not writable (eg: a plain dir run)?  Pass it inline, w/ -c.
+  local f="$shocker_root/.ns.sh"
+  if printf '%s' "$_ns_script" | cmp -s - "$f" 2>/dev/null \
+    || { printf '%s' "$_ns_script" > "$f.$$" && mv -f "$f.$$" "$f"; } 2>/dev/null; then
+    NS_SH=("$f")
+  else
+    rm -f "$f.$$" 2>/dev/null || true
+    NS_SH=(-c "$_ns_script" --)
+  fi
+}
+
 function _run_ns() { # <uuid> <root> <nvols> <workdir> [vol…] <cmd…>   (uses caller's $net)
   local uuid=$1 nsroot=$2 nvols=$3 workdir=$4; shift 4
   local -a netns=(nsenter --net=/run/netns/netns_"$uuid")
   local ns_flags=-fmuip nslo=''
+  local -a NS_SH; _ns_sh
   [[ $net == host ]] && netns=()
   if [[ $ROOTLESS -eq 1 ]]; then
     netns=()
@@ -741,7 +757,7 @@ function _run_ns() { # <uuid> <root> <nvols> <workdir> [vol…] <cmd…>   (uses
   _cg_exec "$uuid" \
     ${netns[@]+"${netns[@]}"} \
       unshare $ns_flags --propagation private ${KILL_CHILD[@]+"${KILL_CHILD[@]}"} \
-        /bin/sh -c "$_ns_script" -- "$@"
+        /bin/sh "${NS_SH[@]}" "$@"
 }
 
 function shocker_exec() { #HELP Execute a command in a running container:\nSHOCKER exec <container_id> <command>
