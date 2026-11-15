@@ -34,9 +34,17 @@ or pass `--fs=btrfs`.
   running process's command line names its id (shocker-relay runs & mounts images by id).  Both
   are read once per prune: on a busy host, per-image `pgrep`s add up.  A run starting after that
   can't pick an old image: names resolve to the current one.
-- **Half-done pulls** (an `img-*` w/o `shocker/source`, which a pull writes last) are only removed
-  when no `shocker pull` is running at all: a directory's mtime doesn't change while files land in
-  its subdirs, so a slow pull can look old.
+- **Half-done pulls** (an `img-*` w/o `shocker/source`, which a pull writes last): each pull holds
+  a lock on `.pull/<img-id>` from before its dir exists until `source` is written -- so a locked
+  one is still pulling, however old it looks (a dir's mtime doesn't change while files land in its
+  subdirs).  Unlocked = the pull died: removed after the grace period.
+
+## Concurrent pulls
+A pull holds a lock on `.pull/<name:tag>` (`/` => `+`).  Another pull of the same image meanwhile
+uses the image we already have (stale, at worst by one update) -- or, w/ none yet, waits for the
+lock, then finds itself up to date (digest check) w/o downloading again.  Locks are on open files,
+so the kernel drops one when its pull exits, however it dies: no heartbeats or timeouts.  (The
+lock is per name:tag, not per registry: pulling the same name from 2 registries at once waits.)
 - **Grace period:** nothing changed in the last 3h (default; `shocker prune SECS`) is touched.
 
 ## bash gotchas

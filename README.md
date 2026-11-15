@@ -323,7 +323,7 @@ Global flags go before the command, eg: `shocker --debug --snitch run --rm alpin
 ## Tests
 Run as a regular user (rootless; each uses a temp image store & pulls alpine):
 ```sh
-tests/rootless.sh   # pull (& digest skip), run, -v/:ro/-e/--net, ps/logs/commit/rm, prune
+tests/rootless.sh   # pull (& digest skip, concurrent pulls), run, -v/:ro/-e/--net, ps/logs/commit/rm, prune
 tests/relay.sh      # shocker-relay: a first container makes ~20 hop requests -- allowed,
                     # refused (escapes, images, flags, env), dropped -- checked against a policy
 ```

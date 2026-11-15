@@ -37,6 +37,16 @@ NEW=$(img_of alpine:latest)
 check "pull: changed digest => new image"      '[[ -n "$NEW" && "$NEW" != "$IMG" ]]'
 check "pull: old image marked _none_"          '[[ "$(< "$SHOCKER_ROOT/$IMG/shocker/source")" == _none_ ]]'
 OLD=$IMG IMG=$NEW
+# another pull of the same image is running (it holds that image's lock)
+flock "$SHOCKER_ROOT/.pull/alpine:latest" sleep 4 &
+sleep 0.5
+out=$($S pull alpine 2>&1)
+check "pull: another running => uses ours"     '[[ "$out" == *"in progress elsewhere -- using $IMG"* ]]'
+flock "$SHOCKER_ROOT/.pull/busybox:latest" sleep 4 &
+sleep 0.5
+out=$(timeout 2 $S pull busybox 2>&1); rc=$?
+check "pull: another running, none here => waits" '[[ $rc == 124 && "$out" == *"Waiting for another pull"* ]]'
+wait
 
 
 # ---- run ----
@@ -108,6 +118,16 @@ out=$($S prune 2>&1)
 check "prune: keeps a recent half-done pull"   '[[ -d "$SHOCKER_ROOT/img-0dead" ]]'
 out=$($S prune 0 2>&1)
 check "prune: removes an old half-done pull"   '[[ ! -d "$SHOCKER_ROOT/img-0dead" ]]'
+mkdir -p "$SHOCKER_ROOT/img-0bee5/shocker"  # (a pull still going: it holds its lock)
+flock "$SHOCKER_ROOT/.pull/img-0bee5" sleep 4 &
+sleep 0.5
+out=$($S images 2>&1)
+check "images: a running pull says pulling"    '[[ "$out" == *"img-0bee5"*"(pulling)"* ]]'
+out=$($S prune 0 2>&1)
+check "prune: keeps a running pull, however old" '[[ -d "$SHOCKER_ROOT/img-0bee5" ]]'
+wait
+out=$($S prune 0 2>&1)
+check "prune: removes it once its pull died"   '[[ ! -d "$SHOCKER_ROOT/img-0bee5" && ! -e "$SHOCKER_ROOT/.pull/img-0bee5" ]]'
 
 
 # ---- prune: orphaned containers ----

@@ -242,6 +242,27 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   # Resolve official images (e.g. "alpine") to library/alpine
   [[ "$name" != */* ]] && name="library/$name"
 
+  # One pull of an image at a time.  Another pull of it is running?
+  # Use the image we have, if any -- else wait for that pull (then we're up to date).
+  # The kernel drops a lock when its pull exits, however it dies: a dead pull never blocks.
+  local pulls="$shocker_root/.pull" pull_fd img_fd cur
+  if [[ -z "${SHOCKER_DEST:-}" ]]; then
+    mkdir -p "$pulls"
+    exec {pull_fd}> "$pulls/${display//\//+}"
+    if ! flock -n "$pull_fd"; then
+      # (/dev/null: w/ nullglob & no images, grep would read stdin)
+      cur="$(grep -lx "$display" /dev/null "$shocker_root"/img-*/shocker/source 2>/dev/null \
+        | tail -1)" || true
+      if [[ -n "$cur" ]]; then
+        cur="${cur%/shocker/source}"
+        echo "Pull of $display in progress elsewhere -- using ${cur##*/} for now"
+        return 0
+      fi
+      echo "Waiting for another pull of $display…"
+      flock "$pull_fd"
+    fi
+  fi
+
   local registry token=''
   local -a auth_hdr=()   # populated only when using Docker Hub token auth
 
@@ -354,6 +375,9 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   else
     uuid="img-$(_uuid)"
     dest="$shocker_root/$uuid"
+    # (locked before the dir exists, until `source` is written: prune leaves a locked one alone)
+    exec {img_fd}> "$pulls/$uuid"
+    flock "$img_fd"
     _subvol_create "$dest"
   fi
   mkdir -p "$dest/shocker"
@@ -410,6 +434,7 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
   # (the tag's digest when pulled: a later pull w/ the same digest skips the download)
   [[ -n "$digest_now" ]] && echo "$digest_now" > "$dest/shocker/digest"
   echo "$display" > "$dest/shocker/source"
+  [[ -n "${uuid:-}" ]] && rm -f "$pulls/$uuid"
   echo "Created: ${uuid:-$dest}"
 }
 
@@ -417,7 +442,7 @@ function shocker_rm() { #HELP Delete an image or container:\nSHOCKER rm <image_i
   [[ "$(shocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
   _subvol_delete "$shocker_root/$1"
   _cg_delete "$1"
-  rm -f "$shocker_root/.rm/$1"
+  rm -f "$shocker_root/.rm/$1" "$shocker_root/.pull/$1"
   echo "Removed: $1"
 }
 
@@ -459,13 +484,14 @@ function shocker_prune() { #HELP Delete orphaned containers, half-done pulls & i
     shocker_rm "$id"
   done
 
-  # Half-done pulls: an img-* w/o `source` (written last) -- the pull died midway.  Only when no
-  # pull is running at all (a big layer can take a long time), & only old ones.
-  grep -qE '(^|[ /])shocker pull ' <<< "$procs" && return 0
+  # Half-done pulls: an img-* w/o `source` (written last), whose pull's lock (.pull/img-*) nobody
+  # holds -- the pull died midway.  (& only old ones.  No lock file: from before pulls locked.)
   for img in "$shocker_root"/img-*; do
     [[ -d "$img" && ! -e "$img/shocker/source" ]] || continue
+    id="${img##*/}" lock="$shocker_root/.pull/${img##*/}"
+    [[ -e "$lock" ]] && ! flock -n "$lock" true && continue
     (( now - $(stat -c %Y "$img") >= min_age )) || continue
-    shocker_rm "${img##*/}"
+    shocker_rm "$id"
   done
 }
 
@@ -473,7 +499,12 @@ function shocker_images() { #HELP List images:\nSHOCKER images
   echo -e "IMAGE_ID\t\tSOURCE"
   for img in "$shocker_root"/img-*; do
     img=$(basename "$img")
-    echo -e "$img\t\t$(cat "$shocker_root/$img/shocker/source" 2>/dev/null || echo '(pulling, or a pull died)')"
+    local src lock="$shocker_root/.pull/$img"
+    if ! src="$(cat "$shocker_root/$img/shocker/source" 2>/dev/null)"; then
+      src='(a pull died)'
+      [[ -e "$lock" ]] && ! flock -n "$lock" true && src='(pulling)'
+    fi
+    echo -e "$img\t\t$src"
   done
 }
 
