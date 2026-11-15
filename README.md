@@ -285,7 +285,8 @@ JOB_ID=42 shocker-relay --policy=my.policy --creds-host=registry.example.com -- 
   -v /srv/jobs/42:/srv/jobs/42 registry.example.com/team/runner ./run-job.sh
 ```
 See [`shocker-relay.policy.example`](shocker-relay.policy.example) for the rule syntax, & the top
-of [`shocker-relay`](shocker-relay) for its options: re-pulling stale images (`--max-age`), only
+of [`shocker-relay`](shocker-relay) for its options: re-pulling stale images (`--max-age`), retrying failed
+pulls (`--pull-tries`), only
 sending registry creds to one host (`--creds-host`), a hook that adds flags to each hop
 (`--hop-hook`, eg: `--mount type=image`), logging to syslog & which `docker run` flags it
 implements.

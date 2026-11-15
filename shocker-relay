@@ -22,8 +22,10 @@
 #   --creds-host=HOST   only pulls from this registry get any SHOCKER_REGISTRY_USER &
 #                       SHOCKER_REGISTRY_PASS.  (Use full image names, eg:
 #                       registry.example.com/team/tool -- a name w/o a host means Docker Hub.)
-#   --max-age=SECS      re-pull a hop's image when its last pull is older (default: 3600).
+#   --max-age=SECS      re-pull a hop's image when its last pull is older (default: 900).  Cheap
+#                       when unchanged: just a manifest HEAD, comparing the tag's digest.
 #                       The first container's image is only pulled when missing.
+#   --pull-tries=N      tries per pull, sleeping 2-6 min, then 3-9 min, … between (default: 3)
 #   --fifo=DIR          the fifo dir (default: a temp dir).  Must be new or empty.
 #   --scratch=DIR       where --tmpfs dirs go (default: a temp dir)
 #   --hop-hook=CMD      run (`bash -c`) before each hop; each line it prints is one more `docker run`
@@ -47,12 +49,13 @@ if [[ "${1:-}" == --sentinel ]]; then  # <first container's pid> <relay's pid> <
   exit 0
 fi
 
-POLICY='' CREDS_HOST='' MAX_AGE=3600 FIFO='' SCRATCH_DIR='' HOOK='' LOGTAG=shocker-relay PRI=user.info
+POLICY='' CREDS_HOST='' MAX_AGE=900 PULL_TRIES=3 FIFO='' SCRATCH_DIR='' HOOK='' LOGTAG=shocker-relay PRI=user.info
 while [[ $# -gt 0 && "$1" == --* ]]; do
   case "$1" in
     --policy=*)     POLICY="${1#*=}" ;;
     --creds-host=*) CREDS_HOST="${1#*=}" ;;
     --max-age=*)    MAX_AGE="${1#*=}" ;;
+    --pull-tries=*) PULL_TRIES="${1#*=}" ;;
     --fifo=*)       FIFO="${1#*=}" ;;
     --scratch=*)    SCRATCH_DIR="${1#*=}" ;;
     --hop-hook=*)   HOOK="${1#*=}" ;;
@@ -133,22 +136,32 @@ function image_id() { # <image> -- its shocker id (img-…), if pulled
 }
 
 function pull() { # <image> <max age secs | missing>
-  local img="$1" id age
+  local img="$1" id age try secs
   id=$(image_id "$img")
   if [[ -n "$id" ]]; then
     [[ "$2" == missing ]] && return 0
     age=$(( $(date +%s) - $(date -r "$STORE/$id/shocker/source" +%s) ))
     [[ $age -lt $2 ]] && return 0
   fi
-  log "pulling $img"
-  (
-    unset SHOCKER_REGISTRY
-    has_host "$img" && export SHOCKER_REGISTRY="${img%%/*}" && img="${img#*/}"
-    # (credentials only go to --creds-host)
-    [[ -n "$CREDS_HOST" && "${SHOCKER_REGISTRY:-}" == "$CREDS_HOST" ]] \
-      || unset SHOCKER_REGISTRY_USER SHOCKER_REGISTRY_PASS
-    shocker pull "$img"
-  )
+  for (( try = 1; ; try++ )); do
+    log "pulling $img"
+    (
+      unset SHOCKER_REGISTRY
+      has_host "$img" && export SHOCKER_REGISTRY="${img%%/*}" && img="${img#*/}"
+      # (credentials only go to --creds-host)
+      [[ -n "$CREDS_HOST" && "${SHOCKER_REGISTRY:-}" == "$CREDS_HOST" ]] \
+        || unset SHOCKER_REGISTRY_USER SHOCKER_REGISTRY_PASS
+      shocker pull "$img"
+    ) && return 0
+    [[ $try -lt $PULL_TRIES ]] || return 1
+    # (eg: registry down for an upgrade.  Sleeping out here, not in `shocker pull`, holds no pull
+    # lock -- other runs can use the image we have meanwhile.)
+    secs=$(( (try + 1) * (60 + RANDOM % 121) ))
+    log "pull of $img failed (try $try of $PULL_TRIES) -- retrying in ${secs}s"
+    sleep $secs
+    # (no one left to run it for?)
+    [[ -z "${FIRST_PID:-}" ]] || kill -0 "$FIRST_PID" 2>/dev/null || return 1
+  done
 }
 
 
