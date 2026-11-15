@@ -38,6 +38,15 @@
 
 set -o errexit -o nounset -o pipefail
 
+# (internal) the sentinel: once the first container exits, wake the relay's read of ready.fifo.
+# Gives up if the relay is gone (eg: SIGKILLed) -- w/ no reader, its write would block forever.
+if [[ "${1:-}" == --sentinel ]]; then  # <first container's pid> <relay's pid> <ready.fifo>
+  while kill -0 "$2" 2>/dev/null && kill -0 "$3" 2>/dev/null; do sleep 0.5; done
+  kill -0 "$3" 2>/dev/null || exit 0
+  timeout 60 bash -c 'echo exit > "$1"' -- "$4" || true
+  exit 0
+fi
+
 POLICY='' CREDS_HOST='' MAX_AGE=3600 FIFO='' SCRATCH_DIR='' HOOK='' LOGTAG=shocker-relay PRI=user.info
 while [[ $# -gt 0 && "$1" == --* ]]; do
   case "$1" in
@@ -312,8 +321,9 @@ SHOCKER_MEM_LIMIT=$MEM_MB setsid shocker run --rm "${SH_ARGS[@]}" -v "$FIFO:/fif
 FIRST_PID=$!
 FIRST_NAME=$NAME
 
-# unblocks the loop below when the first container exits, for any reason
-( while kill -0 $FIRST_PID 2>/dev/null; do sleep 0.5; done; echo exit > "$FIFO/ready.fifo" ) &
+# unblocks the loop below when the first container exits, for any reason.  (Its own name in ps --
+# a plain subshell would show all our args again, looking just like another shocker-relay.)
+( exec -a shocker-relay-sentinel bash "$0" --sentinel "$FIRST_PID" $$ "$FIFO/ready.fifo" ) &
 SENTINEL_PID=$!
 
 
