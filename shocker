@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shocker — Docker implemented in around 500 lines of bash ⚡️
+# shocker — Docker implemented in around 600 lines of bash ⚡️
 # Fork of bocker (github.com/p8952/bocker).  Updated for 2026.
 #   - Docker Registry v2 API (v1 was shut down in 2023)
 #   - cgroups v2 support with v1 fallback
@@ -188,17 +188,17 @@ function _cg_set() { # <id>
   fi
 }
 
-function _cg_exec() { # <id> <cmd…>
+function _cg_exec() { # <id> <cmd…>   -- execs: call it in a subshell
   local id=$1; shift
   if [[ $CGROUP_VERSION -eq 2 ]]; then
     # Write shell PID into cgroup, then exec (cgexec not available for v2)
     # $1=cgroup.procs path, ${@:2}=actual command — exec preserves all quoting
     local cgroot=/sys/fs/cgroup/"$id"
-    bash -c 'echo $$ > "$1" && exec "${@:2}"' -- "${cgroot}/cgroup.procs" "$@"
+    exec bash -c 'echo $$ > "$1" && exec "${@:2}"' -- "${cgroot}/cgroup.procs" "$@"
   elif [[ $CGROUP_VERSION -eq 1 ]]; then
-    cgexec -g "$cgroups_v1:$id" "$@"
+    exec cgexec -g "$cgroups_v1:$id" "$@"
   else
-    "$@"  # (not exec: we're a function -- exec would replace shocker & skip its cleanup)
+    exec "$@"
   fi
 }
 
@@ -573,7 +573,8 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [--
   local -a img_env=()
   local env_file="$meta/env"
   [[ -f "$env_file" ]] && mapfile -t img_env < "$env_file"
-  cmd_args=("env" "-i" "${img_env[@]}" "${env_vars[@]}" "${cmd_args[@]}")
+  # the container's env -- applied at the very end, inside the chroot.  @see _ns_env
+  local -a CENV=(${img_env[@]+"${img_env[@]}"} ${env_vars[@]+"${env_vars[@]}"})
 
   # NOTE: test the flag, not `-d "$img"` -- by now a named image has resolved to eg: img-XXXXX,
   # which is also a (relative) dir when cwd is $shocker_root.
@@ -586,8 +587,9 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [--
     ( "${ns[@]}" true && exit 0; exit 1 ) 2>/dev/null || ns=()
     local rc=0
     local -a NS_SH; _ns_sh
-    nsroot="$img" nvols="${#volumes[@]}" workdir="$workdir" \
-      ${ns[@]+"${ns[@]}"} /bin/sh "${NS_SH[@]}" ${volumes[@]+"${volumes[@]}"} "${cmd_args[@]}" || rc=$?
+    ( _ns_env "$img" "${#volumes[@]}" "$workdir" ''
+      exec ${ns[@]+"${ns[@]}"} /bin/sh "${NS_SH[@]}" ${volumes[@]+"${volumes[@]}"} "${cmd_args[@]}"
+    ) || rc=$?
     # no mount namespace => our /dev, /proc & -v mounts landed on the host; undo them all
     [[ ${#ns[@]} -eq 0 ]] && _umount_under "$img"
     return $rc
@@ -696,67 +698,77 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [--
   [[ -n "$lockfd" ]] && exec {lockfd}>&-
   return $rc
 }
-# Runs inside the new mount namespace (if any).  env: nsroot nvols workdir.  args: [vol…] <cmd…>
+# Runs inside the new mount namespace (if any).  args: [vol…] <cmd…>
+# env (@see _ns_env): _shk_nsroot _shk_nvols _shk_workdir _shk_nslo, & the container's env as
+# _shk_ne & _shk_e_1…_shk_e_N.  (All our names start _shk_: never a container's env var.)
 _ns_script='
   # <root> <path>: echo <path> w/ symlinks resolved as if <root> were /  (".." stops at <root>)
-  _in_root() {
-    _root=$1 _rest=$2 _out= _n=0
+  _shk_in_root() {
+    _shk_root=$1 _shk_rest=$2 _shk_out= _shk_n=0
     while :; do
-      _rest=${_rest#"${_rest%%[!/]*}"}  # strip leading slashes
-      [ -z "$_rest" ] && break
-      _c=${_rest%%/*}
-      case $_rest in */*) _rest=${_rest#*/} ;; *) _rest= ;; esac
-      case $_c in
+      _shk_rest=${_shk_rest#"${_shk_rest%%[!/]*}"}  # strip leading slashes
+      [ -z "$_shk_rest" ] && break
+      _shk_c=${_shk_rest%%/*}
+      case $_shk_rest in */*) _shk_rest=${_shk_rest#*/} ;; *) _shk_rest= ;; esac
+      case $_shk_c in
         .) ;;
-        ..) _out=${_out%/*} ;;
+        ..) _shk_out=${_shk_out%/*} ;;
         *)
-          if [ -L "$_root$_out/$_c" ]; then
-            _n=$((_n+1)); [ $_n -gt 40 ] && return 1
-            _t=$(readlink "$_root$_out/$_c")
-            case $_t in /*) _out= ;; esac  # absolute target: restart from <root>
-            _rest="$_t/$_rest"
+          if [ -L "$_shk_root$_shk_out/$_shk_c" ]; then
+            _shk_n=$((_shk_n+1)); [ $_shk_n -gt 40 ] && return 1
+            _shk_t=$(readlink "$_shk_root$_shk_out/$_shk_c")
+            case $_shk_t in /*) _shk_out= ;; esac  # absolute target: restart from <root>
+            _shk_rest="$_shk_t/$_shk_rest"
           else
-            _out="$_out/$_c"
+            _shk_out="$_shk_out/$_shk_c"
           fi ;;
       esac
     done
-    echo "${_out:-/}"
+    echo "${_shk_out:-/}"
   }
   # <src> <bind mountpoint>: make the bind read-only.  (busybox mount wants src & dst both.)
-  _ro_remount() {
+  _shk_ro_remount() {
     mount -o remount,bind,ro "$1" "$2" 2>/dev/null && return
     # in a user namespace, flags inherited from the outer mount (nodev, nosuid, noexec) are
     # locked, so a remount must repeat them
-    _f=$(awk -v t="$2" "\$2 == t { o = \$4 } END { print o }" /proc/self/mounts \
+    _shk_f=$(awk -v t="$2" "\$2 == t { o = \$4 } END { print o }" /proc/self/mounts \
       | tr , "\n" | grep -xE "nodev|nosuid|noexec" | paste -sd, -)
-    mount -o "remount,bind,ro${_f:+,$_f}" "$1" "$2"
+    mount -o "remount,bind,ro${_shk_f:+,$_shk_f}" "$1" "$2"
   }
+  _shk_r=$_shk_nsroot
   # (rootless --net=none: our fresh netns has loopback down)
-  [ -n "${nslo:-}" ] && ip link set dev lo up
+  [ -n "${_shk_nslo:-}" ] && ip link set dev lo up
   # (rootless cannot mount devtmpfs.  --rbind: in a user namespace a plain --bind of /dev fails,
   # since its submounts, eg: /dev/pts, are locked & a non-recursive bind would hide them.)
-  mount -t devtmpfs devtmpfs "$nsroot/dev" 2>/dev/null || mount --rbind /dev "$nsroot/dev" 2>/dev/null \
+  mount -t devtmpfs devtmpfs "$_shk_r/dev" 2>/dev/null || mount --rbind /dev "$_shk_r/dev" 2>/dev/null \
     || echo "warning: no /dev in container (eg: no /dev/null)" >&2
-  mount -n -t proc proc "$nsroot/proc" 2>/dev/null
-  i=0; while [ "$i" -lt "$nvols" ]; do
-    volarg=$1; shift; i=$((i+1))
-    ro=0; case "$volarg" in *:ro) ro=1; volarg="${volarg%:ro}" ;; esac
-    src="${volarg%%:*}" dst="${volarg#*:}"
+  mount -n -t proc proc "$_shk_r/proc" 2>/dev/null
+  _shk_i=0; while [ "$_shk_i" -lt "$_shk_nvols" ]; do
+    _shk_v=$1; shift; _shk_i=$((_shk_i+1))
+    _shk_ro=0; case "$_shk_v" in *:ro) _shk_ro=1; _shk_v="${_shk_v%:ro}" ;; esac
+    _shk_src="${_shk_v%%:*}" _shk_dst="${_shk_v#*:}"
     # resolve dst *inside* the container root (like docker), so an image symlink, eg: /t -> /var/..,
     # is followed within the image -- not out onto the host
-    dst=$(_in_root "$nsroot" "$dst") || { echo "error: -v $volarg: symlink loop" >&2; exit 1; }
+    _shk_dst=$(_shk_in_root "$_shk_r" "$_shk_dst") \
+      || { echo "error: -v $_shk_v: symlink loop" >&2; exit 1; }
     # (else we would make an empty file at dst & the bind would fail -- a confusing half-container)
-    [ -e "$src" ] || { echo "error: -v $volarg: no such file or directory: $src" >&2; exit 1; }
-    if [ -d "$src" ]; then mkdir -p "$nsroot$dst"
-    else mkdir -p "$(dirname "$nsroot$dst")" && touch "$nsroot$dst"; fi
-    if ! mount --bind "$src" "$nsroot$dst" 2>/dev/null; then
-      echo "warning: could not mount -v $volarg" >&2
-    elif [ "$ro" = 1 ] && ! _ro_remount "$src" "$nsroot$dst"; then
+    [ -e "$_shk_src" ] || { echo "error: -v $_shk_v: no such file or directory: $_shk_src" >&2; exit 1; }
+    if [ -d "$_shk_src" ]; then mkdir -p "$_shk_r$_shk_dst"
+    else mkdir -p "$(dirname "$_shk_r$_shk_dst")" && touch "$_shk_r$_shk_dst"; fi
+    if ! mount --bind "$_shk_src" "$_shk_r$_shk_dst" 2>/dev/null; then
+      echo "warning: could not mount -v $_shk_v" >&2
+    elif [ "$_shk_ro" = 1 ] && ! _shk_ro_remount "$_shk_src" "$_shk_r$_shk_dst"; then
       # never silently fall back to read-write
-      echo "error: could not make -v $volarg read-only" >&2; exit 1
+      echo "error: could not make -v $_shk_v read-only" >&2; exit 1
     fi
   done
-  exec chroot "$nsroot" /bin/sh -c "cd \"$workdir\" && exec \"\$@\"" -- "$@"
+  # the container env: `env -i K=V… <cmd…>` -- args only now, for the instant until env execs
+  _shk_i=${_shk_ne:-0}
+  while [ "$_shk_i" -gt 0 ]; do
+    eval "set -- \"\$_shk_e_$_shk_i\" \"\$@\""  # (eval of a var *name* only)
+    _shk_i=$((_shk_i-1))
+  done
+  exec chroot "$_shk_r" /bin/sh -c "cd \"$_shk_workdir\" && exec \"\$@\"" -- env -i "$@"
 '
 function _ns_sh() { # sets NS_SH: /bin/sh's args to run _ns_script
   # As a file in the store -- so ps shows `/bin/sh …/.ns.sh <args>`, not the whole script.
@@ -784,11 +796,24 @@ function _run_ns() { # <uuid> <root> <nvols> <workdir> [vol…] <cmd…>   (uses
   fi
   # --kill-child: if unshare gets killed (eg: SIGTERM from a supervisor), the container's
   # pid 1 is killed too -- and w/ it, everything in the container's pid namespace
-  nsroot="$nsroot" nvols="$nvols" workdir="$workdir" nslo="$nslo" \
-  _cg_exec "$uuid" \
-    ${netns[@]+"${netns[@]}"} \
-      unshare $ns_flags --propagation private ${KILL_CHILD[@]+"${KILL_CHILD[@]}"} \
-        /bin/sh "${NS_SH[@]}" "$@"
+  # (a subshell, for _ns_env's exports -- _cg_exec execs, so it's unshare in ps, no extra bash)
+  ( _ns_env "$nsroot" "$nvols" "$workdir" "$nslo"
+    _cg_exec "$uuid" \
+      ${netns[@]+"${netns[@]}"} \
+        unshare $ns_flags --propagation private ${KILL_CHILD[@]+"${KILL_CHILD[@]}"} \
+          /bin/sh "${NS_SH[@]}" "$@" )
+}
+
+# Exports what the ns script needs.  Call in a subshell, just before exec'ing it.
+# The container's env (CENV: K=V…) goes as env vars _shk_e_1…_shk_e_N, which the ns script turns
+# into `env -i K=V…` only at its final exec, inside the chroot:
+# - not as args: anyone on the host can read a process's args (ps), but its env only its own
+#   user & root -- like docker
+# - not as themselves: eg: a LD_PRELOAD must never apply to the host's unshare, mount & chroot
+function _ns_env() { # <nsroot> <nvols> <workdir> <nslo>   (uses caller's CENV)
+  local i=0 kv
+  for kv in ${CENV[@]+"${CENV[@]}"}; do i=$((i+1)); export "_shk_e_$i=$kv"; done
+  export _shk_ne=$i _shk_nsroot="$1" _shk_nvols="$2" _shk_workdir="$3" _shk_nslo="$4"
 }
 
 function shocker_exec() { #HELP Execute a command in a running container:\nSHOCKER exec <container_id> <command>

@@ -69,6 +69,13 @@ out=$($S run --rm --net=none -v "$T/nope:/x" alpine true 2>&1); rc=$?
 check "-v: a missing source is an error"       '[[ $rc != 0 ]]'
 out=$($S run --rm --net=none -e FOO=bar alpine sh -c 'echo $FOO $PATH' 2>&1)
 check "-e, & the image's ENV"                  '[[ "$out" == "bar /usr/local/sbin:"* ]]'
+# the container's env must not be in unshare's args: anyone on the host can read those (ps)
+$S run --rm --net=none -e SHK_SECRET=s3cr3t alpine sh -c 'echo $SHK_SECRET; sleep 3' > "$T/sec" 2>&1 &
+sleep 1.5
+leak=$(for p in $(pgrep -x unshare); do tr '\0' ' ' < /proc/$p/cmdline; echo; done)
+wait
+check "-e: the container gets it"              '[[ "$(head -1 "$T/sec")" == s3cr3t ]]'
+check "-e: not in unshare's args (ps)"         '[[ "$leak" == *.ns.sh* && "$leak" != *s3cr3t* ]]'
 out=$($S run --rm --net=none alpine sh -c 'ip -o link | wc -l' 2>&1)
 check "--net=none: loopback only"              '[[ "$out" == 1 ]]'
 out=$($S run --rm --net=none alpine sh -c 'echo x > /dev/null && echo ok' 2>&1)
