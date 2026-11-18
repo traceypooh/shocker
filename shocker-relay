@@ -208,9 +208,10 @@ function translate() { # <docker run args…>
       --tmpfs)
         # (shocker has no tmpfs -- a scratch dir instead, removed after the container)
         val="${val%%:*}"
-        local dir="$SCRATCH_DIR/$((++NSCRATCH))$val"
-        mkdir -p "$dir" && SCRATCH+=("$dir")
-        SH_ARGS+=(-v "$dir:$val") ;;
+        # (removing $top, not just $dir, leaves no empty parents: eg: N/var/tmp)
+        local top="$SCRATCH_DIR/$((++NSCRATCH))"
+        mkdir -p "$top$val" && SCRATCH+=("$top")
+        SH_ARGS+=(-v "$top$val:$val") ;;
       -m|--memory)
         case "${val,,}" in
           *g) MEM_MB=$(( ${val%?} * 1024 )) ;;
@@ -279,13 +280,16 @@ function mount_arg() { # type=image|bind,source=…,destination=…[,readonly]
 
 
 # ---- signals & cleanup ----
-# shocker puts each container under an `unshare --kill-child` -- TERMing that kills the container,
-# then `shocker run` cleans up & returns.
+# shocker puts each container under an `unshare --kill-child` -- KILLing that kills the container,
+# then `shocker run` cleans up & returns.  So a SIGTERM to us (eg: task_exec's interrupt) stops
+# both containers: during a hop, wait_for returns; between hops, the sentinel sends "exit".
 FIRST_PID='' HOP_PID='' SENTINEL_PID='' MADE_FIFOS='' MADE_SCRATCH=''
 
 function kill_containers() {
+  # KILL: `unshare --fork` blocks SIGINT & SIGTERM (they're for its child), so a TERM would just
+  # sit pending.  (Like `docker stop` in effect: a container's pid 1 ignores TERM w/o a handler.)
   local pid
-  for pid in $HOP_PID $FIRST_PID; do pkill -TERM -x unshare -g "$pid" 2>/dev/null || true; done
+  for pid in $HOP_PID $FIRST_PID; do pkill -KILL -x unshare -g "$pid" 2>/dev/null || true; done
 }
 function stop() { # <signal>
   # (syslog only: on HUP/PIPE our stdout is likely gone)

@@ -50,7 +50,7 @@ req sock-dropped   0   --rm -v /var/run/docker.sock:/var/run/docker.sock alpine 
 req env-allowed    0   --rm -e FOO=bar alpine sh -c '[ "$FOO" = bar ]'
 req env-refused    125 --rm -e BAR=1 alpine true
 req env-no-value   125 --rm -e FOO alpine true
-req tmpfs          0   --rm --tmpfs /scratch alpine sh -c 'echo x > /scratch/f'
+req tmpfs          0   --rm --tmpfs /var/tmp/fast alpine sh -c 'echo x > /var/tmp/fast/f'
 req image-mount    0   --rm --mount type=image,source=alpine,destination=/opt/a alpine test -f /opt/a/etc/alpine-release
 REQS+=("bad-json	125	not json")
 printf '%s\n' "${REQS[@]}" | cut -f1,3 > "$FIRST_DIR/requests"
@@ -76,7 +76,7 @@ check "hop allowed: wrote to its job dir"     '[[ "$(cat "$JOB_DIR/out" 2>/dev/n
 check "hop read-only: wrote nothing"          '[[ ! -e "$RO_DIR/x" ]]'
 check "refusals are logged w/ the reason"     '[[ "$out" == *"refused: -v $JOB_DIR/escape (real path: $T/jobs/43)"* ]]'
 check "drops are logged"                      '[[ "$out" == *"dropping --cpus 2"* ]]'
-check "--tmpfs scratch removed"               '[[ -z "$(find "$T/scratch" -type f 2>/dev/null)" ]]'
+check "--tmpfs scratch removed (& its dir)"   '[[ ! -e "$T/scratch" ]]'
 check "fifos removed"                         '[[ ! -e "$T/fifo/ready.fifo" ]]'
 check "no containers left"                    '[[ -z "$(ls -d "$SHOCKER_ROOT"/ps-* 2>/dev/null)" ]]'
 

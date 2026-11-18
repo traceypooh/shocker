@@ -195,7 +195,7 @@ Fri May 22 23:54:38 UTC 2026
 - `run -v /opt/blah` or `-v /opt/blah:ro` — no `dst` means the same path inside (like `systemd-nspawn --bind`; unlike docker, where it makes an anonymous volume)
 - `-v` destinations resolve inside the container root (an image symlink is followed within the image, not onto the host); a missing `-v` source is an error
 - `run` returns the command's exit status (it was always swallowed); non-interactive runs get `/dev/null` as stdin, like docker
-- killing a container's `unshare` kills everything in it (`--kill-child`); container mounts never propagate back to the host
+- killing a container's `unshare` kills everything in it (`--kill-child`) — use SIGKILL: `unshare --fork` blocks SIGINT & SIGTERM; container mounts never propagate back to the host
 - deletes (`rm`, `--rm`, re-pull) unmount first & never cross into another filesystem — a leaked mount can't take host files with it
 - `--debug` timestamps are now wall clock μs; new `--snitch` (see [Debugging](#debugging---debug----snitch))
 - `pull` saves the image's digest & skips the download when the registry's is unchanged (a `HEAD` request: cheap, & not counted against Docker Hub's pull limits)

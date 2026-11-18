@@ -794,8 +794,8 @@ function _run_ns() { # <uuid> <root> <nvols> <workdir> [vol…] <cmd…>   (uses
     netns=()
     [[ $net == none ]] && ns_flags=-fmuipn nslo=x
   fi
-  # --kill-child: if unshare gets killed (eg: SIGTERM from a supervisor), the container's
-  # pid 1 is killed too -- and w/ it, everything in the container's pid namespace
+  # --kill-child: if unshare gets killed, the container's pid 1 is killed too -- & w/ it,
+  # everything in the container's pid namespace.  SIGKILL it: --fork blocks SIGINT & SIGTERM.
   # (a subshell, for _ns_env's exports -- _cg_exec execs, so it's unshare in ps, no extra bash)
   ( _ns_env "$nsroot" "$nvols" "$workdir" "$nslo"
     _cg_exec "$uuid" \
