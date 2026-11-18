@@ -111,6 +111,58 @@ function shocker_check() {
   fi
 }
 
+# OCI whiteouts: a layer deletes what earlier layers made w/ empty marker files --
+#   dir/.wh.NAME       => dir/NAME is gone
+#   dir/.wh..wh..opq   => dir is "opaque": all of dir's contents from earlier layers are gone
+#                         (this layer's own contents of dir stay)
+# Called after extracting each layer (on top of the earlier ones), w/ that layer's paths.
+# (eg: a later `pip install numpy==1.x` layer removing an earlier layer's numpy 2.x)
+function _whiteouts() { # <root> <file: the layer's extracted paths, one per line>
+  grep -q '\.wh\.' "$2" || return 0   # (most layers have none)
+  local root p d name real
+  root="$(realpath -- "$1")"
+  local -A keep=()   # (opaque dirs only) this layer's paths & their parent dirs
+  if grep -q '/\.wh\.\.wh\.\.opq$\|^\.wh\.\.wh\.\.opq$' "$2"; then
+    while IFS= read -r p; do
+      p="${p#./}"; p="${p%/}"
+      while [[ -n "$p" ]]; do
+        [[ -n "${keep[$p]:-}" ]] && break
+        keep[$p]=1
+        [[ "$p" == */* ]] && p="${p%/*}" || p=''
+      done
+    done < "$2"
+  fi
+  while IFS= read -r p; do
+    p="${p#./}"; p="${p%/}"
+    name="${p##*/}"
+    [[ "$p" == */* ]] && d="${p%/*}" || d=''
+    # never follow a symlink out of the image: the marker's dir must really be in <root>
+    real="$(realpath -- "$root/$d" 2>/dev/null)" || continue
+    if [[ "$real" != "$root" && "$real" != "$root"/* ]]; then
+      echo "Ignoring whiteout $p (outside the image)"
+      continue
+    fi
+    if [[ "$name" == .wh..wh..opq ]]; then
+      _whiteout_opaque "$real" "$d"
+    else
+      rm -rf -- "${real:?}/${name#.wh.}"
+    fi
+    rm -f -- "$real/$name"
+  done < <(sed 's|/$||' "$2" | grep '\(^\|/\)\.wh\.[^/]*$')
+}
+function _whiteout_opaque() { # <real dir> <its path in the image> -- uses caller's `keep`
+  local e rel
+  for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [[ -e "$e" || -L "$e" ]] || continue
+    rel="$2/${e##*/}"; rel="${rel#/}"
+    if [[ -z "${keep[$rel]:-}" ]]; then
+      rm -rf -- "$e"
+    elif [[ -d "$e" && ! -L "$e" ]]; then
+      _whiteout_opaque "$e" "$rel"   # (a dir this layer has too: prune earlier layers' files in it)
+    fi
+  done
+}
+
 function _subvol_create() { # <dir>
   if [[ $SHOCKER_FS == btrfs ]]; then
     btrfs subvolume create "$1" > /dev/null
@@ -263,8 +315,33 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
     fi
   fi
 
-  local registry token=''
+  local registry token='' realm='' svc='' auth_at=0
   local -a auth_hdr=()   # populated only when using Docker Hub token auth
+
+  # (Re)fetch a bearer token into `auth_hdr` (no-op for registries w/o auth).  Tokens are
+  # short-lived (gitlab's default: 5 minutes), so big images re-auth between layers -- see `_reauth`.
+  _auth() {
+    auth_at=$SECONDS
+    if [[ -n "${SHOCKER_REGISTRY:-}" ]]; then
+      [[ -z "$realm" ]] && return 0
+      local -a cred_args=()
+      [[ -n "${SHOCKER_REGISTRY_USER:-}" ]] \
+        && cred_args=(-u "${SHOCKER_REGISTRY_USER}:${SHOCKER_REGISTRY_PASS:-}")
+      token="$(curl -fsSL ${cred_args[@]+"${cred_args[@]}"} \
+        "${realm}?service=${svc}&scope=repository:${name}:pull" \
+        | jq -r '.token // .access_token // empty' 2>/dev/null || true)"
+      [[ -n "$token" ]] && auth_hdr=(-H "Authorization: Bearer $token")
+    else
+      token="$(curl -fsSL \
+        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
+        | grep -o '"token":"[^"]*"' | cut -d'"' -f4)"
+      [[ -z "$token" ]] && echo "Failed to authenticate for '$name'" && exit 1
+      auth_hdr=(-H "Authorization: Bearer $token")
+    fi
+    return 0
+  }
+  # New token if the current one is over a minute old (cheap: ~1 request/minute of pulling)
+  _reauth() { (( SECONDS - auth_at < 60 )) || _auth; }
 
   if [[ -n "${SHOCKER_REGISTRY:-}" ]]; then
     # Mirror or private registry: HTTP for non-443 ports, HTTPS otherwise
@@ -277,27 +354,14 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
     www_auth="$(curl -sI "$registry/$name/manifests/$tag" 2>/dev/null \
       | grep -i '^www-authenticate:' | head -1 || true)"
     if [[ -n "$www_auth" ]]; then
-      local realm svc scope
       realm="$(echo "$www_auth" | grep -o 'realm="[^"]*"' | cut -d'"' -f2)"
       svc="$(echo  "$www_auth" | grep -o 'service="[^"]*"' | cut -d'"' -f2)"
-      scope="repository:${name}:pull"
-      local -a cred_args=()
-      [[ -n "${SHOCKER_REGISTRY_USER:-}" ]] \
-        && cred_args=(-u "${SHOCKER_REGISTRY_USER}:${SHOCKER_REGISTRY_PASS:-}")
-      token="$(curl -fsSL "${cred_args[@]}" \
-        "${realm}?service=${svc}&scope=${scope}" \
-        | jq -r '.token // .access_token // empty' 2>/dev/null || true)"
-      [[ -n "$token" ]] && auth_hdr=(-H "Authorization: Bearer $token")
     fi
   else
     # Docker Hub: obtain a bearer token first
     registry='https://registry-1.docker.io/v2'
-    token="$(curl -fsSL \
-      "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
-      | grep -o '"token":"[^"]*"' | cut -d'"' -f4)"
-    [[ -z "$token" ]] && echo "Failed to authenticate for '$name'" && exit 1
-    auth_hdr=(-H "Authorization: Bearer $token")
   fi
+  _auth
 
   local arch; arch="$(uname -m)"
   # Normalise arch to OCI/Docker naming
@@ -393,8 +457,11 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
     tar_opts+=(--exclude='dev/?*' --exclude='./dev/?*')
   fi
 
+  # each layer's extracted paths (tar -v), to apply its whiteouts after.  @see _whiteouts
+  local list; list="$(mktemp)"
   while IFS= read -r digest; do
     echo "Pulling layer ${digest:7:19}…"
+    _reauth
     if [[ -z "${SHOCKER_REGISTRY:-}" ]]; then
       local cdn_url
       cdn_url="$(curl -sw '%{redirect_url}' -o /dev/null \
@@ -408,13 +475,16 @@ function shocker_pull() { #HELP Pull an image from Docker Hub (v2 API):\nSHOCKER
       fi
     else
       curl -fsSL ${auth_hdr[@]+"${auth_hdr[@]}"} "$registry/$name/blobs/$digest"
-    fi | tar xzf - ${tar_opts[@]+"${tar_opts[@]}"} -C "$dest"
+    fi | tar xzvf - ${tar_opts[@]+"${tar_opts[@]}"} -C "$dest" > "$list"
+    _whiteouts "$dest" "$list"
   done <<< "$layers"
+  rm -f "$list"
 
   # Persist ENTRYPOINT+CMD+WORKDIR from the image config blob
   local config_digest
   config_digest="$(echo "$manifest" | jq -r '.config.digest // empty' 2>/dev/null || true)"
   if [[ -n "$config_digest" ]]; then
+    _reauth
     local config
     config="$(curl -fsSL ${auth_hdr[@]+"${auth_hdr[@]}"} "$registry/$name/blobs/$config_digest" 2>/dev/null)" || true
     {
@@ -574,7 +644,13 @@ function shocker_run() { #HELP Create a container:\nSHOCKER run [-it] [--rm] [--
   local env_file="$meta/env"
   [[ -f "$env_file" ]] && mapfile -t img_env < "$env_file"
   # the container's env -- applied at the very end, inside the chroot.  @see _ns_env
-  local -a CENV=(${img_env[@]+"${img_env[@]}"} ${env_vars[@]+"${env_vars[@]}"})
+  # Starts w/ docker's defaults, for when the image & -e don't set them (`env -i`: the last of
+  # a name wins).  eg: triton (via whisper) caches compiled kernels under $HOME.
+  local -a CENV=(
+    'HOME=/root'
+    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    ${img_env[@]+"${img_env[@]}"} ${env_vars[@]+"${env_vars[@]}"}
+  )
 
   # NOTE: test the flag, not `-d "$img"` -- by now a named image has resolved to eg: img-XXXXX,
   # which is also a (relative) dir when cwd is $shocker_root.

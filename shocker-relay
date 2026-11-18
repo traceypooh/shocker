@@ -181,7 +181,7 @@ NSCRATCH=0 SCRATCH=()
 function translate() { # <docker run args…>
   # (shocker's default is a 512 MiB memory limit -- docker's is none, so ours is ~none too)
   IMG='' NAME='' SH_ARGS=() CMD=() MEM_MB=1048576 WHY=''
-  local arg val img
+  local arg val img gpus=0
   while [[ $# -gt 0 ]]; do
     arg="$1"; shift
     if [[ "$arg" == --*=* ]]; then set -- "${arg#*=}" "$@"; arg="${arg%%=*}"; fi
@@ -209,6 +209,7 @@ function translate() { # <docker run args…>
         SH_ARGS+=(-e "$val") ;;
       -v|--volume) volume "$val" || return 1 ;;
       --mount) mount_arg "$val" || return 1 ;;
+      --gpus) gpus=1 ;;  # (any value: all of them -- the host's /dev is in every container anyway)
       --tmpfs)
         # (shocker has no tmpfs -- a scratch dir instead, removed after the container)
         val="${val%%:*}"
@@ -232,6 +233,37 @@ function translate() { # <docker run args…>
   IMG=$(image_id "$img")
   [[ -n "$IMG" ]] || { WHY="no $img after pull"; return 1; }
   NAME="${NAME:-$img}"
+  [[ $gpus -eq 0 ]] || gpu_libs
+}
+
+# docker's --gpus: what nvidia's container runtime adds -- the host's NVIDIA driver libs (which
+# must match the host's kernel module, so images can't ship them), read-only, in a dir on the
+# container's LD_LIBRARY_PATH.  (`nvidia/cuda` images already have /usr/local/nvidia/lib64 on it.)
+# Also like that runtime: the host's `nvidia-smi`, at /usr/bin/nvidia-smi.  (eg: a first
+# container can look for it to decide whether to ask for --gpus for its hops.)
+# The GPU devices themselves: the host /dev every container gets.
+# (These binds are the relay's own -- not requests -- so they skip the `vol` policy.)
+NV_LIBS=/usr/local/nvidia/lib64
+NV_LIB_RE='^lib(cuda|cudadebugger|nvcuvid|nvidia-(ml|ptxjitcompiler|nvvm|encode|opencl|cfg|allocator|gpucomp))\.so\.[0-9]+$'
+function gpu_libs() { # uses IMG; adds to SH_ARGS
+  [[ -e /dev/nvidia0 ]] || { log "--gpus: no GPU here -- ignoring"; return 0; }
+  local soname path n=0 ldp smi ldconfig
+  ldconfig=$(PATH="$PATH:/usr/sbin:/sbin" command -v ldconfig) \
+    || { log "--gpus: no ldconfig -- ignoring"; return 0; }
+  # (64-bit only: ldconfig marks those eg: "(libc6,x86-64)"; 32-bit ones are just "(libc6)")
+  while read -r soname path; do
+    path=$(realpath -- "$path")
+    # (also as the unversioned name, like nvidia's runtime's symlinks: eg: cuDNN dlopen()s
+    #  "libcuda.so", not "libcuda.so.1")
+    SH_ARGS+=(-v "$path:$NV_LIBS/$soname:ro" -v "$path:$NV_LIBS/${soname%.so.*}.so:ro")
+    n=$((n + 1))
+  done < <("$ldconfig" -p 2>/dev/null \
+    | awk -v re="$NV_LIB_RE" '$1 ~ re && $2 ~ /64/ && !seen[$1]++ { print $1, $NF }')
+  [[ $n -gt 0 ]] || { log "--gpus: no NVIDIA driver libs found (ldconfig -p)"; return 0; }
+  # (prepend to the image's own LD_LIBRARY_PATH, if any -- our -e overrides it)
+  ldp=$(sed -n 's/^LD_LIBRARY_PATH=//p' "$STORE/$IMG/shocker/env" 2>/dev/null | tail -1)
+  SH_ARGS+=(-e "LD_LIBRARY_PATH=$NV_LIBS${ldp:+:$ldp}")
+  smi=$(command -v nvidia-smi) && SH_ARGS+=(-v "$(realpath -- "$smi"):/usr/bin/nvidia-smi:ro")
 }
 
 function volume() { # <src[:dst][:ro|:rw]>
