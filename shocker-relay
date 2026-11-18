@@ -31,7 +31,10 @@
 #   --hop-hook=CMD      run (`bash -c`) before each hop; each line it prints is one more `docker run`
 #                       flag for that hop, eg: --mount=type=image,source=IMG,destination=/opt/x
 #                       (the policy checks those too)
-#   --logtag=NAME       log prefix & syslog tag (default: shocker-relay)
+#   --exit-hook=CMD     run (`bash -c`, w/ our exit status as $1) as we exit -- only once our
+#                       containers are gone.  Eg: remove dirs a container cleans up itself
+#                       normally, but can't when killed.  (Not if we're SIGKILLed.)
+#   --logtag=NAME      log prefix & syslog tag (default: shocker-relay)
 #   --syslog=PRIORITY   syslog priority (default: user.info)
 #
 # docker run flags shocker-relay implements -- any other must be dropped (or rejected) by the policy:
@@ -49,7 +52,7 @@ if [[ "${1:-}" == --sentinel ]]; then  # <first container's pid> <relay's pid> <
   exit 0
 fi
 
-POLICY='' CREDS_HOST='' MAX_AGE=900 PULL_TRIES=3 FIFO='' SCRATCH_DIR='' HOOK='' LOGTAG=shocker-relay PRI=user.info
+POLICY='' CREDS_HOST='' MAX_AGE=900 PULL_TRIES=3 FIFO='' SCRATCH_DIR='' HOOK='' EXIT_HOOK='' LOGTAG=shocker-relay PRI=user.info
 while [[ $# -gt 0 && "$1" == --* ]]; do
   case "$1" in
     --policy=*)     POLICY="${1#*=}" ;;
@@ -59,6 +62,7 @@ while [[ $# -gt 0 && "$1" == --* ]]; do
     --fifo=*)       FIFO="${1#*=}" ;;
     --scratch=*)    SCRATCH_DIR="${1#*=}" ;;
     --hop-hook=*)   HOOK="${1#*=}" ;;
+    --exit-hook=*)  EXIT_HOOK="${1#*=}" ;;
     --logtag=*)     LOGTAG="${1#*=}" ;;
     --syslog=*)     PRI="${1#*=}" ;;
     --) shift; break ;;
@@ -296,7 +300,30 @@ function stop() { # <signal>
   logger -t "$LOGTAG" -p "$PRI" -- "stopping containers ($1)" 2>/dev/null || true
   kill_containers
 }
+function alive() { # <pid> -- & not a zombie (eg: a child we never got to `wait` for)
+  local st
+  st=$(awk '/^State:/ { print $2 }' "/proc/$1/status" 2>/dev/null) && [[ -n "$st" && "$st" != Z ]]
+}
+function group_alive() { # <pgid> -- any live process in it?
+  local p
+  for p in $(pgrep -g "$1" 2>/dev/null); do alive "$p" && return 0; done
+  return 1
+}
+function exit_hook() { # <our exit status>
+  [[ -n "$EXIT_HOOK" ]] || return 0
+  # Never while a container may still use what the hook removes -- however it ended (eg: someone
+  # killed just its `shocker run`, by hand).  Each container's whole process group (its `shocker
+  # run`, unshare & all in it) gets up to 3 min to be gone (just killed, if still going -- a
+  # badly overloaded host can take a while).
+  local pid i
+  for pid in $HOP_PID $FIRST_PID; do
+    for (( i = 0; i < 360; i++ )); do group_alive "$pid" || break; sleep 0.5; done
+    group_alive "$pid" && { log "--exit-hook skipped: container (pgid $pid) still running"; return 0; }
+  done
+  bash -c "$EXIT_HOOK" -- "$1" || log "--exit-hook failed"
+}
 function cleanup() {
+  local rc=$?
   kill_containers
   [[ -n "$SENTINEL_PID" ]] && kill "$SENTINEL_PID" 2>/dev/null || true
   [[ -n "$MADE_FIFOS" ]] && rm -f "$FIFO/ready.fifo" "$FIFO/resume.fifo"
@@ -305,6 +332,7 @@ function cleanup() {
   # (only if empty -- ours or not)
   [[ -n "$FIFO" ]] && rmdir "$FIFO" 2>/dev/null || true
   [[ -n "$SCRATCH_DIR" ]] && rmdir "$SCRATCH_DIR" 2>/dev/null || true
+  exit_hook $rc
   return 0
 }
 for sig in HUP TERM PIPE INT; do trap "stop $sig" $sig; done  # (cleanup runs at EXIT)

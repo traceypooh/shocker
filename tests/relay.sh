@@ -56,7 +56,8 @@ REQS+=("bad-json	125	not json")
 printf '%s\n' "${REQS[@]}" | cut -f1,3 > "$FIRST_DIR/requests"
 
 # the first container: send each request, print its resume status, then exit 3
-out=$(shocker-relay --policy="$T/policy" --fifo="$T/fifo" --scratch="$T/scratch" -- \
+out=$(shocker-relay --policy="$T/policy" --fifo="$T/fifo" --scratch="$T/scratch" \
+  --exit-hook="{ echo \$1; ls -d '$SHOCKER_ROOT'/ps-* 2>/dev/null; } > '$T/exit-hook'" -- \
   --rm --net=none -v "$FIRST_DIR:/first" alpine sh -c '
     while IFS="	" read -r name req; do
       echo "$req" > "$SHOCKER_RELAY_FIFO/ready.fifo"
@@ -79,6 +80,7 @@ check "drops are logged"                      '[[ "$out" == *"dropping --cpus 2"
 check "--tmpfs scratch removed (& its dir)"   '[[ ! -e "$T/scratch" ]]'
 check "fifos removed"                         '[[ ! -e "$T/fifo/ready.fifo" ]]'
 check "no containers left"                    '[[ -z "$(ls -d "$SHOCKER_ROOT"/ps-* 2>/dev/null)" ]]'
+check "--exit-hook ran (w/ exit status), after containers gone" '[[ "$(cat "$T/exit-hook" 2>/dev/null)" == 3 ]]'
 
 # the first container must pass the policy too
 out=$(shocker-relay --policy="$T/policy" -- --rm -v "$T/jobs/43:/x" alpine true 2>&1); rc=$?
