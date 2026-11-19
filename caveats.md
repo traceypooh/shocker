@@ -7,8 +7,6 @@ Edge cases & reasoning that don't need to be in the README.
   new user namespace, a sibling of the container's, & `nsenter` can't join namespaces from there.
   It would need to skip the re-exec & `nsenter -U` (as the user who owns the container's user
   namespace, who has full rights in it).
-- **OCI whiteouts:** `pull` doesn't apply layer deletions (`.wh.*` files, & `.wh..wh..opq` for
-  whole-dir replacement), so files a later layer deleted come back.
 
 ## Storage auto-pick
 With no `--fs=`, shocker uses btrfs only if `$SHOCKER_ROOT` is on btrfs *right now*.  If a btrfs
